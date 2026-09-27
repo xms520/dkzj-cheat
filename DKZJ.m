@@ -351,6 +351,26 @@ static void *m_Char_getCurrentHp, *m_Char_setCurrentHp;
 static void *m_BM_AddExpAndGold, *m_BM_OnMissionClear, *m_BM_OnChapterEnd;
 static void *m_BD_AddUserExp, *m_BD_AddDropGold, *m_BD_AddWaveGold, *m_BD_AddDiamond;
 static void *m_AD_CheckAndPlayVideo;
+// ★ BattleWorldContext 上的正确功能入口 (v3.3: 之前用 BattleData/BattleManager 层级太低, 无 UI 事件刷新)
+static void *m_CTX_AddUserExp;          // ctx.AddUserExp(exp)
+static void *m_CTX_AddDropGold;         // ctx.AddDropGold(gold)
+static void *m_CTX_AddWaveGold;         // ctx.AddWaveGold(gold, hasEffect)
+static void *m_CTX_AddNewWaveGold;      // ctx.AddNewWaveGold(gold)
+static void *m_CTX_DisPathGoldUpdate;   // ctx.DisPathGoldUpdateEvent(hasEffect)
+static void *m_CTX_ShowExpUI;           // ctx.ShowExpUI()
+static void *m_CTX_TriggerLevelUp;      // ctx.TriggerLevelUpEvent(player)
+static void *m_CTX_GetUserExp;          // ctx.get_UserExp()
+static void *m_CTX_SetWinPlayerId;      // ctx.SetWinPlayerId(playerId)
+static void *m_CTX_IncreaseMission;     // ctx.IncreaseMission(addExp)
+static void *m_CTX_GetCurMissionId;     // ctx.get_CurMissionId()
+static void *m_CTX_getCurWave;          // ctx.get_CurWave()
+static void *m_CTX_getMissionCount;     // ctx.get_MissionCount()
+static void *m_CTX_getCurMissionIndex;  // ctx.get_CurMissionIndex()
+static void *m_CTX_getIsChapterComplete;// ctx.get_IsChapterComplete()
+static void *m_CTX_GMSetCurMissionId;   // ctx.GMSetCurMissionId(missionId)
+static void *m_CTX_AddExpAndGold;       // ctx.AddExpAndGold()
+static void *m_CTX_OnWaveEnd;           // ctx.OnWaveEnd()
+static int32_t g_myPlayerId = -1;       // WorldBattle.MyPlayerId (字段直读)
 static void *m_Ad_Show0;
 static void *m_GM_SetTimeScale, *m_Game_SetTimeScale;
 static void *m_UO_FindObjectOfType;
@@ -394,7 +414,7 @@ static Il2CppClass *cn(Il2CppImage img, const char *ns, const char *name) {
 // ── 分步状态机 ──
 enum { RS_WAIT_DOMAIN=0, RS_HF, RS_HFB, RS_AD, RS_COR,
        RS_C1, RS_C1b, RS_C2, RS_C2b, RS_C3, RS_C3b, RS_C3c,
-       RS_M1, RS_M1b, RS_M2, RS_M2b, RS_M2c, RS_M3, RS_M3b, RS_M4, RS_M4b,
+       RS_M1, RS_M1b, RS_M1c, RS_M1d, RS_M2, RS_M2b, RS_M2c, RS_M3, RS_M3b, RS_M4, RS_M4b,
        RS_OFF, RS_DONE, RS_FAIL };
 static int g_rs = RS_WAIT_DOMAIN;
 static int g_rsTick = 0;
@@ -484,6 +504,37 @@ static void resolve_step(void) {
             m_Ctx_getBattleMgr = mof(k_Ctx, "get_BattleMgr", 0);
             m_Ctx_getBattleData= mof(k_Ctx, "get_BattleData", 0);
             L("A[M1b] ctxEntity=%p ctxBM=%p ctxBD=%p", m_Ctx_getEntity, m_Ctx_getBattleMgr, m_Ctx_getBattleData);
+            g_rs = RS_M2; break;
+        case RS_M1c:
+            if (k_Ctx) {
+                m_CTX_AddUserExp          = mof(k_Ctx, "AddUserExp", 1);
+                m_CTX_AddDropGold         = mof(k_Ctx, "AddDropGold", 1);
+                m_CTX_AddWaveGold         = mof(k_Ctx, "AddWaveGold", 2);
+                m_CTX_AddNewWaveGold      = mof(k_Ctx, "AddNewWaveGold", 1);
+                m_CTX_DisPathGoldUpdate   = mof(k_Ctx, "DisPathGoldUpdateEvent", 1);
+                m_CTX_ShowExpUI           = mof(k_Ctx, "ShowExpUI", 0);
+                m_CTX_TriggerLevelUp      = mof(k_Ctx, "TriggerLevelUpEvent", 1);
+                m_CTX_GetUserExp          = mof(k_Ctx, "get_UserExp", 0);
+            }
+            L("A[M1c] ctxExp=%p ctxGold=%p ctxWaveGold=%p goldEvent=%p",
+              m_CTX_AddUserExp, m_CTX_AddDropGold, m_CTX_AddWaveGold, m_CTX_DisPathGoldUpdate);
+            g_rs = RS_M1d; break;
+        case RS_M1d:
+            if (k_Ctx) {
+                m_CTX_SetWinPlayerId      = mof(k_Ctx, "SetWinPlayerId", 1);
+                m_CTX_IncreaseMission     = mof(k_Ctx, "IncreaseMission", 1);
+                m_CTX_GetCurMissionId     = mof(k_Ctx, "get_CurMissionId", 0);
+                m_CTX_getCurWave          = mof(k_Ctx, "get_CurWave", 0);
+                m_CTX_getMissionCount     = mof(k_Ctx, "get_MissionCount", 0);
+                m_CTX_getCurMissionIndex  = mof(k_Ctx, "get_CurMissionIndex", 0);
+                m_CTX_getIsChapterComplete= mof(k_Ctx, "get_IsChapterComplete", 0);
+                m_CTX_GMSetCurMissionId   = mof(k_Ctx, "GMSetCurMissionId", 1);
+                m_CTX_AddExpAndGold       = mof(k_Ctx, "AddExpAndGold", 0);
+                m_CTX_OnWaveEnd           = mof(k_Ctx, "OnWaveEnd", 0);
+            }
+            L("A[M1d] win=%p incMission=%p curMission=%p wave=%p count=%p",
+              m_CTX_SetWinPlayerId, m_CTX_IncreaseMission, m_CTX_GetCurMissionId,
+              m_CTX_getCurWave, m_CTX_getMissionCount);
             g_rs = RS_M2; break;
         case RS_M2:
             if (k_EM) {
@@ -917,16 +968,70 @@ static void do_invincible(void) {
 }
 
 // ───────────────────── 功能 ③ 一键通关 ─────────────────────
+// v3.3 修正: BattleManager.OnMissionClear() 是抽象基类实现, 清波/下一关流程不跑。
+// 改为 BattleWorldContext 路线: 先清场 → IncreaseMission(1) 推进关卡 → SetWinPlayerId 判胜
+//   IncreaseMission 内部会处理 mission 索引 + 波次; GMSetCurMissionId 可直接跳关。
 static void do_pass_chapter(void) {
     void *ctx = get_ctx();
     if (!ctx) { if (g_statusSub) g_statusSub.text = @"未在战斗中"; return; }
-    do_kill();
+    do_kill();                                     // ① 先清场, 否则波次逻辑会重新刷怪
+
+    int32_t beforeMission = -1, beforeWave = -1, missionCount = 0;
+    if (m_CTX_GetCurMissionId) {
+        Il2CppObject *r = ic_call(m_CTX_GetCurMissionId, ctx, NULL);
+        beforeMission = r ? *(int32_t *)((uint8_t *)r + 0x10) : -1;
+    }
+    if (m_CTX_getCurWave) {
+        Il2CppObject *r = ic_call(m_CTX_getCurWave, ctx, NULL);
+        beforeWave = r ? *(int32_t *)((uint8_t *)r + 0x10) : -1;
+    }
+    if (m_CTX_getMissionCount) {
+        Il2CppObject *r = ic_call(m_CTX_getMissionCount, ctx, NULL);
+        missionCount = r ? *(int32_t *)((uint8_t *)r + 0x10) : 0;
+    }
+    // 玩家 id: WorldBattle.MyPlayerId 字段直读 (off 未知时用 1)
+    int32_t pid = g_myPlayerId;
+    if (pid <= 0) {
+        void *w = get_world();
+        if (w) {
+            static int32_t offPid = -2;
+            if (offPid == -2) offPid = foff(k_WorldBattle, "MyPlayerId");
+            if (offPid > 0) pid = *(int32_t *)((uint8_t *)w + offPid);
+        }
+        if (pid > 0) g_myPlayerId = pid;
+    }
+    int done = 0;
+    // ① 结束当前波
+    if (m_CTX_OnWaveEnd) { ic_call(m_CTX_OnWaveEnd, ctx, NULL); done++; }
+    // ② 推进关卡 (addExp=1 表示附带经验结算)
+    if (m_CTX_IncreaseMission) { int32_t ae = 1; void *a[1] = { &ae }; ic_call(m_CTX_IncreaseMission, ctx, a); done++; }
+    // ③ 直接跳到最后一关 (若 missionCount 已知)
+    if (m_CTX_GMSetCurMissionId && missionCount > 0) {
+        int32_t last = missionCount - 1;
+        void *a[1] = { &last };
+        ic_call(m_CTX_GMSetCurMissionId, ctx, a); done++;
+    }
+    // ④ 标记胜利者 (结算判定用)
+    if (m_CTX_SetWinPlayerId && pid > 0) { void *a[1] = { &pid }; ic_call(m_CTX_SetWinPlayerId, ctx, a); done++; }
+    // ⑤ 兜底: BattleManager 路线
     void *bm = ctx_battlemgr(ctx);
-    if (!bm) { if (g_statusSub) g_statusSub.text = @"BattleManager 未就绪"; return; }
-    if (m_BM_OnMissionClear) ic_call(m_BM_OnMissionClear, bm, NULL);
-    if (m_BM_OnChapterEnd)   ic_call(m_BM_OnChapterEnd, bm, NULL);
-    L("③ pass: OnMissionClear=%p OnChapterEnd=%p", m_BM_OnMissionClear, m_BM_OnChapterEnd);
-    if (g_statusSub) g_statusSub.text = @"一键通关已触发 (清场+过关判定)";
+    if (bm) {
+        if (m_BM_OnMissionClear) { ic_call(m_BM_OnMissionClear, bm, NULL); done++; }
+        if (m_BM_OnChapterEnd)   { ic_call(m_BM_OnChapterEnd, bm, NULL); done++; }
+    }
+    int32_t afterMission = -1, afterWave = -1;
+    if (m_CTX_GetCurMissionId) {
+        Il2CppObject *r = ic_call(m_CTX_GetCurMissionId, ctx, NULL);
+        afterMission = r ? *(int32_t *)((uint8_t *)r + 0x10) : -1;
+    }
+    if (m_CTX_getCurWave) {
+        Il2CppObject *r = ic_call(m_CTX_getCurWave, ctx, NULL);
+        afterWave = r ? *(int32_t *)((uint8_t *)r + 0x10) : -1;
+    }
+    L("③ pass: mission %d→%d wave %d→%d (总关%d pid=%d) incMission=%p win=%p done=%d",
+      beforeMission, afterMission, beforeWave, afterWave, missionCount, pid,
+      m_CTX_IncreaseMission, m_CTX_SetWinPlayerId, done);
+    if (g_statusSub) g_statusSub.text = [NSString stringWithFormat:@"通关: 关%d→%d", beforeMission, afterMission];
 }
 
 // ───────────────────── 功能 ④ 游戏加速 ─────────────────────
@@ -977,35 +1082,64 @@ static void restore_speed(void) {
 }
 
 // ───────────────────── 功能 ⑥ 局内经验 ─────────────────────
+// v3.3 修正: 原 BattleData.AddUserExp 只写 PlayerExp 字段, 无 UI/升级事件 → 肉眼无感。
+// 改为 BattleWorldContext.AddUserExp (会走 DispatchUpdateExpRenderEvent + 升级判定) + ShowExpUI。
 static void do_add_exp(void) {
     void *ctx = get_ctx();
     if (!ctx) { if (g_statusSub) g_statusSub.text = @"未在战斗中"; return; }
-    void *bd = ctx_battledata(ctx);
     int done = 0;
-    if (bd && m_BD_AddUserExp) {
-        int32_t v = g_expValue;
+    int32_t v = g_expValue;
+    if (m_CTX_AddUserExp) {
         void *a[1] = { &v };
-        ic_call(m_BD_AddUserExp, bd, a);
+        ic_call(m_CTX_AddUserExp, ctx, a);
         done++;
     }
-    void *bm = ctx_battlemgr(ctx);
-    if (bm && m_BM_AddExpAndGold) { ic_call(m_BM_AddExpAndGold, bm, NULL); done++; }
-    L("⑥ exp: AddUserExp(%d)=%d AddExpAndGold=%d done=%d", g_expValue,
-      m_BD_AddUserExp ? 1 : 0, m_BM_AddExpAndGold ? 1 : 0, done);
+    if (m_CTX_ShowExpUI) { ic_call(m_CTX_ShowExpUI, ctx, NULL); done++; }
+    // 辅助: 结算型 AddExpAndGold (ctx 版本)
+    if (m_CTX_AddExpAndGold) { ic_call(m_CTX_AddExpAndGold, ctx, NULL); done++; }
+    // 兜底: 旧的 BattleData 路线
+    if (!m_CTX_AddUserExp) {
+        void *bd = ctx_battledata(ctx);
+        if (bd && m_BD_AddUserExp) { void *a[1] = { &v }; ic_call(m_BD_AddUserExp, bd, a); done++; }
+    }
+    static int el = 0;
+    if (++el <= 3 || el % 20 == 0) {
+        int32_t back = 0;
+        if (m_CTX_GetUserExp) {
+            Il2CppObject *r = ic_call(m_CTX_GetUserExp, ctx, NULL);
+            back = r ? *(int32_t *)((uint8_t *)r + 0x10) : 0;
+        }
+        L("⑥ exp: ctx.AddUserExp(%d)=%p ShowExpUI=%p done=%d UserExp回读=%d",
+          g_expValue, m_CTX_AddUserExp, m_CTX_ShowExpUI, done, back);
+    }
     if (g_statusSub) g_statusSub.text = [NSString stringWithFormat:@"已加经验 +%d", g_expValue];
 }
 
 // ───────────────────── 功能 ⑦ 局内金币 ─────────────────────
+// v3.3 修正: 原 BattleData.AddDropGold 只写 _dropGold 字段, 不刷 UI。
+// 改为 BattleWorldContext.AddDropGold/AddWaveGold(2参, hasEffect=true) + DisPathGoldUpdateEvent(1)。
 static void do_add_gold(void) {
     void *ctx = get_ctx();
     if (!ctx) { if (g_statusSub) g_statusSub.text = @"未在战斗中"; return; }
-    void *bd = ctx_battledata(ctx);
-    if (!bd) { if (g_statusSub) g_statusSub.text = @"BattleData 未就绪"; return; }
     int32_t v = g_goldValue;
-    void *a[1] = { &v };
-    if (m_BD_AddDropGold) ic_call(m_BD_AddDropGold, bd, a);
-    if (m_BD_AddWaveGold) ic_call(m_BD_AddWaveGold, bd, a);
-    L("⑦ gold: AddDropGold(%d)=%p AddWaveGold=%p", g_goldValue, m_BD_AddDropGold, m_BD_AddWaveGold);
+    int done = 0;
+    if (m_CTX_AddDropGold) { void *a[1] = { &v }; ic_call(m_CTX_AddDropGold, ctx, a); done++; }
+    if (m_CTX_AddWaveGold) {
+        int32_t hasEffect = 1;
+        void *a[2] = { &v, &hasEffect };
+        ic_call(m_CTX_AddWaveGold, ctx, a); done++;
+    }
+    if (m_CTX_DisPathGoldUpdate) { int32_t he = 1; void *a[1] = { &he }; ic_call(m_CTX_DisPathGoldUpdate, ctx, a); done++; }
+    // 兜底
+    if (!m_CTX_AddDropGold) {
+        void *bd = ctx_battledata(ctx);
+        if (bd && m_BD_AddDropGold) { void *a[1] = { &v }; ic_call(m_BD_AddDropGold, bd, a); done++; }
+        if (bd && m_BD_AddWaveGold) { void *a[1] = { &v }; ic_call(m_BD_AddWaveGold, bd, a); done++; }
+    }
+    static int gl = 0;
+    if (++gl <= 3 || gl % 20 == 0)
+        L("⑦ gold: ctxAddDropGold=%p ctxAddWaveGold=%p goldEvent=%p done=%d",
+          m_CTX_AddDropGold, m_CTX_AddWaveGold, m_CTX_DisPathGoldUpdate, done);
     if (g_statusSub) g_statusSub.text = [NSString stringWithFormat:@"已加金币 +%d", g_goldValue];
 }
 
@@ -1297,7 +1431,7 @@ static void dk_build_ui(void) {
     y += 58;
     mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), panel);
     y += 52;
-    mkLabel(@"弹壳战机 1.1.7 · 单机PvE · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.3 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithRed:0.69 green:0.69 blue:0.73 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -1375,7 +1509,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.1 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.3 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
