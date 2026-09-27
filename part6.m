@@ -13,7 +13,7 @@ static void dk_crash_streak_set(int v) {
     [ud synchronize];
 }
 
-static __block BOOL g_installed = NO;   // 防重入 (同一进程多次触发)
+static BOOL g_installed = NO;   // 防重入 (同一进程多次触发)
 
 static void dk_install_all(void) {
     if (g_installed) return;

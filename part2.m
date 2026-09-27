@@ -148,3 +148,26 @@ static void    *list_at(void *lst, int i) {
     if (!items) return NULL;
     return *(void **)((uint8_t *)items + 0x20 + 8 * i);
 }
+
+// ── 世界实例获取 ──
+static void *ic_find_image(const char *want) {
+    if (!ic_ready || !ic_domain_ready()) return NULL;
+    if (!I.domain_get_assemblies || !I.assembly_get_image) return NULL;
+    void *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) {
+        size_t n = 0;
+        void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
+        if (asms && n < 4096) {
+            for (size_t i = 0; i < n; i++) {
+                if (!asms[i]) continue;
+                Il2CppImage img = I.assembly_get_image(asms[i]);
+                if (!img) continue;
+                const char *nm = I.image_get_name ? I.image_get_name(img) : NULL;
+                if (nm && !strcmp(nm, want)) { r = img; break; }
+            }
+        }
+    }
+    DK_GUARD_END();
+    return r;
+}
+

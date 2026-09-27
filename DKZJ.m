@@ -298,6 +298,29 @@ static void    *list_at(void *lst, int i) {
     return *(void **)((uint8_t *)items + 0x20 + 8 * i);
 }
 
+// ── 世界实例获取 ──
+static void *ic_find_image(const char *want) {
+    if (!ic_ready || !ic_domain_ready()) return NULL;
+    if (!I.domain_get_assemblies || !I.assembly_get_image) return NULL;
+    void *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) {
+        size_t n = 0;
+        void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
+        if (asms && n < 4096) {
+            for (size_t i = 0; i < n; i++) {
+                if (!asms[i]) continue;
+                Il2CppImage img = I.assembly_get_image(asms[i]);
+                if (!img) continue;
+                const char *nm = I.image_get_name ? I.image_get_name(img) : NULL;
+                if (nm && !strcmp(nm, want)) { r = img; break; }
+            }
+        }
+    }
+    DK_GUARD_END();
+    return r;
+}
+
+
 // ───────────────────── 类/方法解析: 主线程分步状态机 ─────────────────────
 // ⚠️ 关键教训 (v3.0 真机 .log):
 //   il2cpp_domain_get_assemblies / class_from_name 从【非主线程】首次调用 → SIGSEGV。
@@ -523,28 +546,6 @@ static void resolve_step(void) {
         return;
     case RS_DONE: case RS_FAIL: default: return;
     }
-}
-
-// ── 世界实例获取 ──
-static void *ic_find_image_safe(const char *want) {
-    if (!ic_ready || !ic_domain_ready()) return NULL;
-    if (!I.domain_get_assemblies || !I.assembly_get_image) return NULL;
-    void *r = NULL;
-    if (DK_GUARD_BEGIN() == 0) {
-        size_t n = 0;
-        void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
-        if (asms && n < 4096) {
-            for (size_t i = 0; i < n; i++) {
-                if (!asms[i]) continue;
-                Il2CppImage img = I.assembly_get_image(asms[i]);
-                if (!img) continue;
-                const char *nm = I.image_get_name ? I.image_get_name(img) : NULL;
-                if (nm && !strcmp(nm, want)) { r = img; break; }
-            }
-        }
-    }
-    DK_GUARD_END();
-    return r;
 }
 
 static void *get_world(void) {
@@ -1333,7 +1334,7 @@ static void dk_crash_streak_set(int v) {
     [ud synchronize];
 }
 
-static __block BOOL g_installed = NO;   // 防重入 (同一进程多次触发)
+static BOOL g_installed = NO;   // 防重入 (同一进程多次触发)
 
 static void dk_install_all(void) {
     if (g_installed) return;
