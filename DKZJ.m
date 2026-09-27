@@ -504,7 +504,7 @@ static void resolve_step(void) {
             m_Ctx_getBattleMgr = mof(k_Ctx, "get_BattleMgr", 0);
             m_Ctx_getBattleData= mof(k_Ctx, "get_BattleData", 0);
             L("A[M1b] ctxEntity=%p ctxBM=%p ctxBD=%p", m_Ctx_getEntity, m_Ctx_getBattleMgr, m_Ctx_getBattleData);
-            g_rs = RS_M2; break;
+            g_rs = RS_M1c; break;
         case RS_M1c:
             if (k_Ctx) {
                 m_CTX_AddUserExp          = mof(k_Ctx, "AddUserExp", 1);
@@ -677,6 +677,18 @@ static void *vmi(void *obj, const char *name, int argc) {
         if (m) return m;
     }
     return NULL;
+}
+
+// 运行时类名 (诊断用: 确认拿到的对象类型正确)
+static const char *cls_name_of(void *obj) {
+    if (!obj || !I.object_get_class || !I.class_get_name) return "?";
+    const char *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) {
+        Il2CppClass *k = (Il2CppClass *)I.object_get_class(obj);
+        if (k) r = I.class_get_name(k);
+    }
+    DK_GUARD_END();
+    return r ? r : "?";
 }
 
 static BOOL is_inst_of(void *obj, Il2CppClass *k) {
@@ -1167,7 +1179,19 @@ static void combat_tick(void) {
             static BOOL wasIn = NO;
             if (alive != wasIn) {
                 wasIn = alive; g_inBattle = alive;
-                L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", get_world(), get_ctx());
+                void *w0 = get_world(), *c0 = get_ctx();
+                L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", w0, c0);
+                if (alive) {
+                    void *em0 = ctx_entity(c0), *bm0 = ctx_battlemgr(c0), *bd0 = ctx_battledata(c0);
+                    L("   RTTI: world=%s ctx=%s EM=%s BM=%s BD=%s",
+                      cls_name_of(w0), cls_name_of(c0), cls_name_of(em0), cls_name_of(bm0), cls_name_of(bd0));
+                    static int32_t offPid2 = -2;
+                    if (offPid2 == -2) offPid2 = foff(k_WorldBattle, "MyPlayerId");
+                    if (offPid2 > 0) {
+                        g_myPlayerId = *(int32_t *)((uint8_t *)w0 + offPid2);
+                        L("   MyPlayerId(off 0x%x) = %d", offPid2, g_myPlayerId);
+                    } else L("   MyPlayerId 字段未命中 (off=%d)", offPid2);
+                }
                 if (alive) {
                     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
                     [ud setInteger:0 forKey:@"dk3_crashStreak"];
@@ -1431,7 +1455,7 @@ static void dk_build_ui(void) {
     y += 58;
     mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), panel);
     y += 52;
-    mkLabel(@"弹壳战机 1.1.7 · v3.3 · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.4 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithRed:0.69 green:0.69 blue:0.73 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -1509,7 +1533,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.3 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.4 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
