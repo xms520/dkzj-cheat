@@ -1369,7 +1369,7 @@ static UIView *mkToggleCard(CGRect f, NSString *emoji, UIColor *bg, NSString *ti
 }
 // 步进卡: − 值 ＋
 static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, NSString *sub,
-                          UILabel **outVal, id tgt, SEL dec, SEL inc, UIView *p) {
+                          UILabel * __strong *outVal, id tgt, SEL dec, SEL inc, UIView *p) {
     UIView *c = mkCard(f, p);
     mkIcon(emoji, bg, CGRectMake(8, (f.size.height - 28) / 2, 28, 28), c);
     mkLabel(title, 13, UIFontWeightSemibold, DK_TEXT, CGRectMake(42, 4, f.size.width - 150, 16), c);
