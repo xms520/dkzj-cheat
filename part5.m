@@ -232,14 +232,14 @@ static void dk_build_ui(void) {
     // 标题栏
     mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), g_panel);
     g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), g_panel);
-    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom];
-    x.frame = CGRectMake(W - 40, 14, 26, 26);
-    x.backgroundColor = DK_RED; x.layer.cornerRadius = 13;
-    [x setTitle:@"✕" forState:UIControlStateNormal];
-    [x setTitleColor:[UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1] forState:UIControlStateNormal];
-    x.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [x addTarget:g_helper action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    [g_panel addSubview:x];
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    closeBtn.frame = CGRectMake(W - 40, 14, 26, 26);
+    closeBtn.backgroundColor = DK_RED; closeBtn.layer.cornerRadius = 13;
+    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1] forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [closeBtn addTarget:g_helper action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [g_panel addSubview:closeBtn];
 
     y = 52;
     mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死",  g_killOn,  g_helper, @selector(killSw:),  g_panel);

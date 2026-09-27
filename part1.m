@@ -33,6 +33,7 @@
 #include <os/proc.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <dlfcn.h>
 #include <string.h>
@@ -78,13 +79,13 @@ static UILabel  *g_expVal = nil, *g_goldVal = nil, *g_spdVal = nil;
 
 // ───────────────────── SIGSEGV 安全网 ─────────────────────
 static volatile sig_atomic_t g_guardActive = 0;
+static volatile sig_atomic_t g_guardDepth = 0;
 static sigjmp_buf g_guardEnv;
 static void dk_segv_handler(int sig) {
     if (g_guardActive) { g_guardActive = 0; g_guardDepth = 0; siglongjmp(g_guardEnv, 1); }
     signal(sig, SIG_DFL);
     raise(sig);
 }
-static int g_guardDepth = 0;
 static void dk_guard_install(void) {
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = dk_segv_handler;
