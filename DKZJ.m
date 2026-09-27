@@ -1,39 +1,24 @@
 //
-//  DKZJ.m — 弹壳战机 1.1.7 (com.survivor.acecn) 悬浮助手 v3.0
+//  DKZJ.m — 弹壳战机 1.1.7 (com.survivor.acecn) 悬浮助手 v3.1
 //  ═══════════════════════════════════════════════════════════════════════
+//  v3.1 修正 (真机 .log 判决: v3.0 在 il2cpp_domain_get_assemblies 首次调用处闪退)
+//   ① 类解析从【后台线程】搬到【主线程分步状态机】—— il2cpp Assembly 惰性初始化
+//      与游戏主线程存在竞态, 后台线程首调必崩 (MXYZF v1.7 同源教训)
+//   ② 就绪判据改为 il2cpp_domain_get() 非 NULL (il2cpp_init 完成即置位, 零副作用),
+//      而非直接调 get_assemblies 试探
+//   ③ 删除 LC_SYMTAB nlist 全表扫描 (LC_SYMTAB 字段被加固改写 → nl 指针落在 __DATA
+//      → 野指针读; dlsym 已实证可用 241 个 il2cpp 导出, 无需该路径)
+//   ④ 崩溃自动熔断: 连续启动 3 次未进战斗 → 写 dkzj3_off 自我禁用 (保护设备)
+//   ⑤ 日志格式 %@ → %s
+//
 //  引擎: Unity 2022.3.62f2 IL2CPP + HybridCLR 热更 (HotFix.dll / HotFixBattle.dll)
-//  metadata v31 全量解析实证 (30214 类型, 逻辑全在热更层, 无混淆)
-//
-//  功能 (7 项, 全部走 il2cpp 运行时反射, 零 __TEXT patch):
-//    ① 怪物自杀/秒杀   EntityManager.GetEntityValues → EntityCharacter.SetHp(0)+OnDeath
-//                      优先 EntityManager.EnemyCommitSuicide(entity, reason)
-//    ② 无敌            EntityCharacter.AddAbsoluteInvincibility() + set_CurrentHp
-//    ③ 一键通关        BattleManager.OnMissionClear() / SetWinPlayerId+CreateBattleEndEvent
-//    ④ 游戏加速        WorldContext.gameSpeed 直写 (sim 逻辑倍速, Q16.16 定点)
-//    ⑤ 免广告          ADModuleMgr.CheckAndPlayVideo methodPointer 热替换(直回调)
-//                      + AdData.GetLeftAdCount 无限次
-//    ⑥ 局内经验增加    BattleData.AddUserExp(n) / BattleManager.AddExpAndGold()
-//    ⑦ 局内金币增加    BattleData.AddDropGold(n) / AddWaveGold(n)
-//
-//  调用链 (全走方法调用, 不硬编码偏移):
-//    BattleGame.get_World() → WorldBattle
-//      → get_LogicWorld() → BattleLogicWorld → <_worldContext 字段>
-//        → BattleWorldContext
-//           .get_Entity()      → EntityManager
-//           .get_BattleMgr()   → BattleManager
-//           .get_BattleData()  → BattleData
-//
-//  铁律: 类解析在后台线程(il2cpp_thread_attach), 功能执行在主线程 tick
-//        SIGSEGV 守卫 | 只对目标包注入 | 帧同步游戏仅单机 PvE
-//  ⚠️ 联机会上行命令到服务器, 勿在联机模式开启
+//  ⚠️ 单机 PvE 专用; 联机命令上行服务器, 勿开
 //  ═══════════════════════════════════════════════════════════════════════
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#include <os/proc.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
-#include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <dlfcn.h>
 #include <string.h>
@@ -44,31 +29,41 @@
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <unistd.h>
 
 // ───────────────────── 日志 ─────────────────────
+static NSString *dk_doc_path(void);
 static void L(const char *fmt, ...) {
     char msg[768];
     va_list ap; va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *doc = paths.firstObject;
+    NSString *doc = dk_doc_path();
     if (doc) {
-        FILE *f = fopen([doc stringByAppendingPathComponent:@"dkzj3.log"].fileSystemRepresentation, "a");
+        NSString *p = [doc stringByAppendingPathComponent:@"dkzj3.log"];
+        FILE *f = fopen(p.fileSystemRepresentation, "a");
         if (f) { fprintf(f, "%s\n", msg); fclose(f); }
     }
     NSLog(@"[DKZJ3] %s", msg);
 }
+static NSString *dk_doc_path(void) {
+    static NSString *c = nil;
+    if (!c) {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        c = paths.count ? paths.firstObject : nil;
+    }
+    return c;
+}
 
 // ───────────────────── 功能开关 ─────────────────────
-static BOOL  g_killOn   = NO;    // ① 秒杀
-static BOOL  g_invOn    = NO;    // ② 无敌
-static BOOL  g_speedOn  = NO;    // ④ 加速
-static BOOL  g_noAdOn   = NO;    // ⑤ 免广告
+static BOOL  g_killOn   = NO;
+static BOOL  g_invOn    = NO;
+static BOOL  g_speedOn  = NO;
+static BOOL  g_noAdOn   = NO;
 static BOOL  g_speedWasOn = NO;
 static float g_speedMult = 2.0f;
-static int   g_expValue  = 1000;   // ⑥ 单次经验
-static int   g_goldValue = 1000;   // ⑦ 单次金币
+static int   g_expValue  = 1000;
+static int   g_goldValue = 1000;
 static BOOL  g_inBattle = NO;
 
 static UIButton *g_ball = nil;
@@ -79,8 +74,9 @@ static UILabel  *g_expVal = nil, *g_goldVal = nil, *g_spdVal = nil;
 
 // ───────────────────── SIGSEGV 安全网 ─────────────────────
 static volatile sig_atomic_t g_guardActive = 0;
-static volatile sig_atomic_t g_guardDepth = 0;
+static volatile sig_atomic_t g_guardDepth  = 0;
 static sigjmp_buf g_guardEnv;
+
 static void dk_segv_handler(int sig) {
     if (g_guardActive) { g_guardActive = 0; g_guardDepth = 0; siglongjmp(g_guardEnv, 1); }
     signal(sig, SIG_DFL);
@@ -91,9 +87,8 @@ static void dk_guard_install(void) {
     sa.sa_handler = dk_segv_handler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
 }
-// 嵌套安全: 用深度计数, 内层退出不解除外层保护
 #define DK_GUARD_BEGIN() (g_guardDepth++, g_guardActive = 1, sigsetjmp(g_guardEnv, 1))
 #define DK_GUARD_END()   do { if (g_guardDepth > 0) g_guardDepth--; if (g_guardDepth == 0) g_guardActive = 0; } while (0)
 
@@ -101,6 +96,7 @@ static void dk_guard_install(void) {
 static uint64_t g_unityBase = 0;
 static uint64_t g_textSize  = 0;
 static int      g_slide     = 0;
+static int      g_sdkVer    = 0;
 
 static const struct mach_header_64 *dk_unity_header(void) {
     uint32_t n = _dyld_image_count();
@@ -131,117 +127,34 @@ static uint64_t find_unity_base(void) {
     return g_unityBase;
 }
 
-// ───────────────────── 内存 Mach-O 符号表 (CJCS 实证方案) ─────────────────────
-// UnityFramework 的 il2cpp_* 在 1.1.7 里同时在 EXPORTS_TRIE 中(dlsym 可用),
-// 但 LC_SYMTAB 的 nsyms/symoff 字段被加固改写 → 静态枚举不可靠。
-// 双路: ① dlsym(RTLD_DEFAULT) ② LC_SYMTAB nlist 全表扫描 (含 __LINKEDIT 换算)
-typedef struct { const char *name; uintptr_t addr; } dk_sym_t;
-static dk_sym_t *g_syms = NULL;
-static uint32_t  g_symCount = 0;
-static int32_t  *g_hashBucket = NULL;
-static uint32_t  g_hashMask = 0;
-static int       g_symsReady = 0;
-
-static uint32_t dk_hash(const char *s) {
-    uint32_t h = 5381;
-    while (*s) h = ((h << 5) + h) + (unsigned char)(*s++);
-    return h;
-}
-
-static void dk_syms_load(void) {
-    if (g_symsReady) return;
-    g_symsReady = 1;
-    const struct mach_header_64 *mh = dk_unity_header();
-    if (!mh) { L("sym: UnityFramework 未找到"); return; }
-    const struct load_command *lc = (const struct load_command *)((const char *)mh + sizeof(struct mach_header_64));
-    const struct symtab_command *st = NULL;
-    const struct segment_command_64 *le = NULL;
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            if (!strcmp(sg->segname, "__LINKEDIT")) le = sg;
-        }
-        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
-    }
-    if (!st || !le) { L("sym: LC_SYMTAB/__LINKEDIT 缺失"); return; }
-    // vmaddr-fileoff 差值 (1.1.7: __LINKEDIT vmaddr 0xAF8A000 fileoff 0xAF8A000 → 差 0)
-    uintptr_t le_delta = (uintptr_t)(le->vmaddr - le->fileoff);
-    // nlist 表: 文件偏移 st->symoff → 运行时 = mh + le_delta + slide + symoff
-    //   (mh 已含 slide, 不能再加; CJCS 的坑: mh 指针来自 dyld → 已滑动)
-    const struct nlist_64 *nl  = (const struct nlist_64 *)((uintptr_t)mh + le_delta + st->symoff);
-    const char            *str = (const char *)((uintptr_t)mh + le_delta + st->stroff);
-    uint32_t nsyms = st->nsyms;
-    // 加固可能改写 nsyms → 用 (stroff - symoff)/16 与 nsyms 取大值, 上限保护
-    if (st->stroff > st->symoff) {
-        uint32_t byGap = (st->stroff - st->symoff) / 16;
-        if (byGap < 4000000) nsyms = (byGap > nsyms) ? byGap : nsyms;
-    }
-    if (nsyms > 4000000) nsyms = 4000000;
-    g_syms = (dk_sym_t *)calloc(nsyms > 0 ? nsyms : 1, sizeof(dk_sym_t));
-    if (!g_syms) { L("sym: calloc 失败"); return; }
-    // 两遍扫描: 先计数再精确分配 (避免大块 malloc 被杀)
-    uint32_t kept = 0;
-    for (uint32_t i = 0; i < nsyms; i++) {
-        uint32_t sx = nl[i].n_un.n_strx;
-        if (!nl[i].n_value || sx == 0 || sx >= st->strsize) continue;
-        const char *nm = str + sx;
-        if (nm[0] != '_') continue;
-        if (!strncmp(nm, "_il2cpp_", 8) || !strncmp(nm, "_mono_", 6) || !strncmp(nm, "_lua", 4)) {
-            g_syms[kept].name = strdup(nm);
-            g_syms[kept].addr = (uintptr_t)(nl[i].n_value + g_slide);
-            kept++;
-            if (kept >= nsyms) break;
-        }
-    }
-    g_symCount = kept;
-    L("sym: nlist scan nsyms=%u kept=%u (slide=%d)", nsyms, kept, g_slide);
-    if (kept == 0) return;
-    uint32_t cap = 1; while (cap < kept * 2) cap <<= 1;
-    g_hashBucket = (int32_t *)malloc(cap * sizeof(int32_t));
-    if (!g_hashBucket) return;
-    for (uint32_t i = 0; i < cap; i++) g_hashBucket[i] = -1;
-    g_hashMask = cap - 1;
-    for (uint32_t i = 0; i < kept; i++) {
-        uint32_t b = dk_hash(g_syms[i].name) & g_hashMask;
-        while (g_hashBucket[b] != -1) b = (b + 1) & g_hashMask;
-        g_hashBucket[b] = (int32_t)i;
-    }
-    L("sym: hash ready cap=%u", cap);
-}
-
-static void *dk_sym_find(const char *name) {
-    // ① dlsym 优先 (1.1.7 EXPORTS_TRIE 实证含 241 个 il2cpp 符号)
-    void *p = dlsym(RTLD_DEFAULT, name);
-    if (p) return p;
-    p = dlsym(RTLD_DEFAULT, name + 1);   // 去掉前导下划线再试
-    if (p) return p;
-    // ② 内存符号表
-    if (g_hashBucket) {
-        uint32_t b = dk_hash(name) & g_hashMask;
-        while (g_hashBucket[b] != -1) {
-            if (!strcmp(g_syms[g_hashBucket[b]].name, name))
-                return (void *)g_syms[g_hashBucket[b]].addr;
-            b = (b + 1) & g_hashMask;
-        }
-    }
-    return NULL;
-}
-
 static int dk_ptr_executable(uintptr_t a) {
     if (!a) return 0;
-    uintptr_t lo = g_unityBase, hi = g_unityBase + g_textSize;
-    return (a >= lo && a < hi) ? 1 : 0;
+    return (a >= g_unityBase && a < g_unityBase + g_textSize) ? 1 : 0;
 }
 
-// ───────────────────── il2cpp C API ─────────────────────
+// ───────────────────── 符号解析: 只走 dlsym ─────────────────────
+// ⚠️ v3.1: 删除 LC_SYMTAB 扫描。该二进制 LC_SYMTAB 的 symoff/nsyms 被加固改写
+//    (symoff 指向 __DATA 段), 全表扫描 = 野指针读 → 不可控崩溃。
+//    1.1.7 实证: LC_DYLD_EXPORTS_TRIE @0xabbbc00 有效, 241 个 il2cpp_* 全部可 dlsym。
+static int g_dlsymHits = 0;
+static void *dk_sym_find(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (!p && name[0] == '_') p = dlsym(RTLD_DEFAULT, name + 1);
+    if (!p && name[0] != '_') {
+        char buf[128]; snprintf(buf, sizeof(buf), "_%s", name);
+        p = dlsym(RTLD_DEFAULT, buf);
+    }
+    if (p) g_dlsymHits++;
+    return p;
+}
+
+// ───────────────────── il2cpp C API (dlsym) ─────────────────────
 typedef void* Il2CppDomain;
 typedef void* Il2CppImage;
 typedef void* Il2CppClass;
 typedef void* Il2CppMethodInfo;
 typedef void* Il2CppFieldInfo;
 typedef void* Il2CppObject;
-typedef void* Il2CppString;
 
 typedef struct {
     Il2CppDomain      (*domain_get)(void);
@@ -264,7 +177,7 @@ typedef struct {
     void              (*field_static_get_value)(Il2CppFieldInfo *, void *);
     void              (*field_static_set_value)(Il2CppFieldInfo *, void *);
     Il2CppObject*     (*runtime_invoke)(Il2CppMethodInfo *, void *, void **, void **);
-    Il2CppString*     (*string_new)(const char *);
+    Il2CppObject*     (*string_new)(const char *);
     Il2CppObject*     (*object_new)(Il2CppClass *);
     void*             (*thread_attach)(Il2CppDomain);
     void*             (*thread_current)(void);
@@ -276,6 +189,8 @@ typedef struct {
     const char*       (*image_get_name)(Il2CppImage);
     size_t            (*image_get_class_count)(Il2CppImage);
     Il2CppClass*      (*image_get_class)(Il2CppImage, size_t);
+    void*             (*class_get_type)(Il2CppClass *);
+    void*             (*type_get_object)(void *);
 } dk_il2cpp_t;
 
 static dk_il2cpp_t I;
@@ -283,112 +198,93 @@ static BOOL ic_ready = NO;
 
 static BOOL ic_init(void) {
     if (ic_ready) return YES;
-    if (!g_unityBase) return NO;
+    if (!g_unityBase) { L("ic: unity base 未就绪"); return NO; }
     memset(&I, 0, sizeof(I));
-    I.domain_get                  = (void*)dk_sym_find("_il2cpp_domain_get");
-    I.domain_get_assemblies       = (void*)dk_sym_find("_il2cpp_domain_get_assemblies");
-    I.assembly_get_image          = (void*)dk_sym_find("_il2cpp_assembly_get_image");
-    I.class_from_name             = (void*)dk_sym_find("_il2cpp_class_from_name");
-    I.class_get_method_from_name  = (void*)dk_sym_find("_il2cpp_class_get_method_from_name");
-    I.class_get_methods           = (void*)dk_sym_find("_il2cpp_class_get_methods");
-    I.class_get_field_from_name   = (void*)dk_sym_find("_il2cpp_class_get_field_from_name");
-    I.class_get_fields            = (void*)dk_sym_find("_il2cpp_class_get_fields");
-    I.class_get_parent            = (void*)dk_sym_find("_il2cpp_class_get_parent");
-    I.class_get_name              = (void*)dk_sym_find("_il2cpp_class_get_name");
-    I.class_get_namespace         = (void*)dk_sym_find("_il2cpp_class_get_namespace");
-    I.method_get_name             = (void*)dk_sym_find("_il2cpp_method_get_name");
-    I.method_get_param_count      = (void*)dk_sym_find("_il2cpp_method_get_param_count");
-    I.field_get_name              = (void*)dk_sym_find("_il2cpp_field_get_name");
-    I.field_get_offset            = (void*)dk_sym_find("_il2cpp_field_get_offset");
-    I.field_get_value             = (void*)dk_sym_find("_il2cpp_field_get_value");
-    I.field_set_value             = (void*)dk_sym_find("_il2cpp_field_set_value");
-    I.field_static_get_value      = (void*)dk_sym_find("_il2cpp_field_static_get_value");
-    I.field_static_set_value      = (void*)dk_sym_find("_il2cpp_field_static_set_value");
-    I.runtime_invoke              = (void*)dk_sym_find("_il2cpp_runtime_invoke");
-    I.string_new                  = (void*)dk_sym_find("_il2cpp_string_new");
-    I.object_new                  = (void*)dk_sym_find("_il2cpp_object_new");
-    I.thread_attach               = (void*)dk_sym_find("_il2cpp_thread_attach");
-    I.thread_current              = (void*)dk_sym_find("_il2cpp_thread_current");
-    I.gc_disable                  = (void*)dk_sym_find("_il2cpp_gc_disable");
-    I.object_get_class            = (void*)dk_sym_find("_il2cpp_object_get_class");
-    I.class_is_assignable_from    = (void*)dk_sym_find("_il2cpp_class_is_assignable_from");
-    I.value_box                   = (void*)dk_sym_find("_il2cpp_value_box");
-    I.class_init                  = (void*)dk_sym_find("_il2cpp_runtime_class_init");
-    I.image_get_name              = (void*)dk_sym_find("_il2cpp_image_get_name");
-    I.image_get_class_count       = (void*)dk_sym_find("_il2cpp_image_get_class_count");
-    I.image_get_class             = (void*)dk_sym_find("_il2cpp_image_get_class");
+    I.domain_get                  = (void*)dk_sym_find("il2cpp_domain_get");
+    I.domain_get_assemblies       = (void*)dk_sym_find("il2cpp_domain_get_assemblies");
+    I.assembly_get_image          = (void*)dk_sym_find("il2cpp_assembly_get_image");
+    I.class_from_name             = (void*)dk_sym_find("il2cpp_class_from_name");
+    I.class_get_method_from_name  = (void*)dk_sym_find("il2cpp_class_get_method_from_name");
+    I.class_get_methods           = (void*)dk_sym_find("il2cpp_class_get_methods");
+    I.class_get_field_from_name   = (void*)dk_sym_find("il2cpp_class_get_field_from_name");
+    I.class_get_fields            = (void*)dk_sym_find("il2cpp_class_get_fields");
+    I.class_get_parent            = (void*)dk_sym_find("il2cpp_class_get_parent");
+    I.class_get_name              = (void*)dk_sym_find("il2cpp_class_get_name");
+    I.class_get_namespace         = (void*)dk_sym_find("il2cpp_class_get_namespace");
+    I.method_get_name             = (void*)dk_sym_find("il2cpp_method_get_name");
+    I.method_get_param_count      = (void*)dk_sym_find("il2cpp_method_get_param_count");
+    I.field_get_name              = (void*)dk_sym_find("il2cpp_field_get_name");
+    I.field_get_offset            = (void*)dk_sym_find("il2cpp_field_get_offset");
+    I.field_get_value             = (void*)dk_sym_find("il2cpp_field_get_value");
+    I.field_set_value             = (void*)dk_sym_find("il2cpp_field_set_value");
+    I.field_static_get_value      = (void*)dk_sym_find("il2cpp_field_static_get_value");
+    I.field_static_set_value      = (void*)dk_sym_find("il2cpp_field_static_set_value");
+    I.runtime_invoke              = (void*)dk_sym_find("il2cpp_runtime_invoke");
+    I.string_new                  = (void*)dk_sym_find("il2cpp_string_new");
+    I.object_new                  = (void*)dk_sym_find("il2cpp_object_new");
+    I.thread_attach               = (void*)dk_sym_find("il2cpp_thread_attach");
+    I.thread_current              = (void*)dk_sym_find("il2cpp_thread_current");
+    I.gc_disable                  = (void*)dk_sym_find("il2cpp_gc_disable");
+    I.object_get_class            = (void*)dk_sym_find("il2cpp_object_get_class");
+    I.class_is_assignable_from    = (void*)dk_sym_find("il2cpp_class_is_assignable_from");
+    I.value_box                   = (void*)dk_sym_find("il2cpp_value_box");
+    I.class_init                  = (void*)dk_sym_find("il2cpp_runtime_class_init");
+    I.image_get_name              = (void*)dk_sym_find("il2cpp_image_get_name");
+    I.image_get_class_count       = (void*)dk_sym_find("il2cpp_image_get_class_count");
+    I.image_get_class             = (void*)dk_sym_find("il2cpp_image_get_class");
+    I.class_get_type              = (void*)dk_sym_find("il2cpp_class_get_type");
+    I.type_get_object             = (void*)dk_sym_find("il2cpp_type_get_object");
     int miss = 0;
     struct { const char *n; void *p; } req[] = {
-        {"domain_get", I.domain_get}, {"domain_get_assemblies", I.domain_get_assemblies},
-        {"assembly_get_image", I.assembly_get_image}, {"class_from_name", I.class_from_name},
+        {"domain_get", I.domain_get},
+        {"domain_get_assemblies", I.domain_get_assemblies},
+        {"assembly_get_image", I.assembly_get_image},
+        {"class_from_name", I.class_from_name},
         {"class_get_method_from_name", I.class_get_method_from_name},
-        {"class_get_field_from_name", I.class_get_field_from_name},
-        {"field_get_offset", I.field_get_offset}, {"runtime_invoke", I.runtime_invoke},
+        {"runtime_invoke", I.runtime_invoke},
         {"object_get_class", I.object_get_class},
+        {"class_get_field_from_name", I.class_get_field_from_name},
     };
     for (size_t i = 0; i < sizeof(req)/sizeof(req[0]); i++) {
         uintptr_t a = (uintptr_t)req[i].p;
         if (!a) { miss++; L("ic: MISSING %s", req[i].n); }
-        else if (!dk_ptr_executable(a)) L("ic: OUT-OF-RANGE %s = %p", req[i].n, req[i].p);
+        else if (!dk_ptr_executable(a)) L("ic: ⚠️ OUT-OF-TEXT %s=%p (符号来自其他镜像, 可用)", req[i].n, req[i].p);
     }
     if (miss) { L("ic: %d 必需 API 缺失 → 禁用", miss); return NO; }
     ic_ready = YES;
-    L("ic ✓ il2cpp C API 就绪 (domain_get=%p invoke=%p)", I.domain_get, I.runtime_invoke);
+    L("ic ✓ il2cpp C API 就绪 (%d 符号, domain_get=%p invoke=%p)",
+      g_dlsymHits, I.domain_get, I.runtime_invoke);
     return YES;
 }
 
-static void ic_ensure_thread(void) {
-    if (!ic_ready || !I.domain_get) return;
-    Il2CppDomain dom = I.domain_get();
-    if (!dom) return;
-    if (I.thread_current && !I.thread_current() && I.thread_attach) I.thread_attach(dom);
+// 域就绪探测: il2cpp_init 完成后 domain 即非 NULL (零副作用, 不触发 Assembly 惰性初始化)
+static BOOL ic_domain_ready(void) {
+    if (!ic_ready || !I.domain_get) return NO;
+    void *d = NULL;
+    if (DK_GUARD_BEGIN() == 0) d = I.domain_get();
+    DK_GUARD_END();
+    return d ? YES : NO;
 }
 
-static Il2CppImage ic_find_image(const char *want) {
-    if (!ic_ready) return NULL;
-    Il2CppDomain dom = I.domain_get();
-    if (!dom) return NULL;
-    size_t n = 0;
-    void **asms = (void **)I.domain_get_assemblies(dom, &n);
-    if (!asms) return NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (!asms[i]) continue;
-        Il2CppImage img = I.assembly_get_image(asms[i]);
-        if (!img) continue;
-        const char *nm = I.image_get_name ? I.image_get_name(img) : NULL;
-        if (nm && !strcmp(nm, want)) return img;
-    }
-    return NULL;
-}
-
-// 方法调用包装: 参数按 il2cpp_runtime_invoke 约定 (值类型传指针, 引用类型传对象)
+// 方法调用包装
 static Il2CppObject *ic_call(void *mi, void *obj, void **args) {
     if (!mi || !I.runtime_invoke) return NULL;
     void *exc = NULL;
-    return I.runtime_invoke(mi, obj, args, &exc);   // exc 忽略(异常时返回 NULL)
+    return I.runtime_invoke(mi, obj, args, &exc);
 }
-
-static int ic_call_i32(void *mi, void *obj, int32_t arg) {
+static int32_t ic_call_i32(void *mi, void *obj, int32_t arg) {
     void *args[1] = { &arg };
     Il2CppObject *r = ic_call(mi, obj, args);
-    return r ? *(int32_t *)((uint8_t *)r + 0x10) : 0;   // 装箱 int32 → 值在 +0x10
+    return r ? *(int32_t *)((uint8_t *)r + 0x10) : 0;
 }
-
 static int64_t ic_call_i64(void *mi, void *obj, int64_t arg) {
     void *args[1] = { &arg };
     Il2CppObject *r = ic_call(mi, obj, args);
     return r ? *(int64_t *)((uint8_t *)r + 0x10) : 0;
 }
 
-static float ic_call_f(void *mi, void *obj, float arg) {
-    void *args[1] = { &arg };
-    Il2CppObject *r = ic_call(mi, obj, args);
-    return r ? *(float *)((uint8_t *)r + 0x10) : 0.0f;
-}
-
-// List<T> / 数组 布局 (Il2CppArray: [klass 0x00][monitor 0x08][bounds 0x10][max_length 0x18][data 0x20])
 // Il2CppArray: [klass 0x00][monitor 0x08][bounds 0x10][max_length 0x18][data 0x20]
-static int32_t arr_len(void *arr)  { return arr ? *(int32_t *)((uint8_t *)arr + 0x18) : 0; }
+static int32_t arr_len(void *arr) { return arr ? *(int32_t *)((uint8_t *)arr + 0x18) : 0; }
 static void    *arr_at(void *arr, int i) {
     if (!arr || i < 0) return NULL;
     return *(void **)((uint8_t *)arr + 0x20 + 8 * i);
@@ -402,348 +298,277 @@ static void    *list_at(void *lst, int i) {
     return *(void **)((uint8_t *)items + 0x20 + 8 * i);
 }
 
-// ───────────────────── 类/方法解析 (后台线程, 两阶段) ─────────────────────
-static Il2CppImage g_imgHF  = NULL;   // HotFix.dll (WorldBattle/BattleGame/Game/ADModuleMgr...)
-static Il2CppImage g_imgHFB = NULL;   // HotFixBattle.dll (BattleLogic.* 战斗核心)
-static Il2CppImage g_imgCOR = NULL;   // mscorlib.dll
+// ───────────────────── 类/方法解析: 主线程分步状态机 ─────────────────────
+// ⚠️ 关键教训 (v3.0 真机 .log):
+//   il2cpp_domain_get_assemblies / class_from_name 从【非主线程】首次调用 → SIGSEGV。
+//   而 SIGSEGV handler 里的 siglongjmp 是【线程绑定】的: 后台线程 longjmp 到主线程
+//   sigsetjmp 环境 = 未定义行为 → 二次崩溃, guard 完全失效 (日志实证: 直接重启)。
+//   → 全部 il2cpp 反射调用必须只在【主线程】执行, 且每 tick 只走一小步。
+//   另: il2cpp_init 完成后 il2cpp_domain_get() 即非 NULL (零副作用) → 用它做就绪判据,
+//       不主动调 get_assemblies 试探。
 
-// 类
+static Il2CppImage g_imgHF  = NULL;
+static Il2CppImage g_imgHFB = NULL;
+static Il2CppImage g_imgAD  = NULL;
+static Il2CppImage g_imgCOR = NULL;
+
 static Il2CppClass *k_BattleGame, *k_WorldBattle, *k_BLW, *k_Ctx;
 static Il2CppClass *k_EM, *k_Char, *k_Hero, *k_TDD, *k_BattleMgr, *k_BattleData;
-static Il2CppClass *k_ADMgr, *k_AdData, *k_I64;
-static Il2CppClass *k_Game, *k_GameMgr;
+static Il2CppClass *k_ADMgr, *k_AdData, *k_I64, *k_Ad_Local;
+static Il2CppClass *k_Game, *k_GameMgr, *k_UObject;
 
-// 方法 (BattleGame/WorldBattle)
-static void *m_BG_getWorld;        // BattleGame.get_World  (static)
-static void *m_WB_getLogicWorld;   // WorldBattle.get_LogicWorld (instance)
-static void *m_WB_StopTime, *m_WB_ResetTime, *m_WB_SetLevel, *m_WB_SetPlayerAttackAndCurHp;
-// 上下文访问器 (instance)
-static void *m_Ctx_getEntity, *m_Ctx_getBattleMgr, *m_Ctx_getBattleData, *m_Ctx_getBattleFrame;
-// EntityManager
-static void *m_EM_GetEntityValues, *m_EM_GetAllPlayer, *m_EM_GetPlayer;
-// EntityCharacter
+static void *m_BG_getWorld, *m_WB_getLogicWorld, *m_WB_StopTime, *m_WB_ResetTime, *m_WB_SetLevel;
+static void *m_Ctx_getEntity, *m_Ctx_getBattleMgr, *m_Ctx_getBattleData;
+static void *m_EM_GetEntityValues, *m_EM_GetAllPlayer, *m_EM_GetPlayer, *m_EM_EnemyCommitSuicide;
 static void *m_Char_SetHp, *m_Char_GetHp, *m_Char_OnDeath, *m_Char_UpdateHp;
-static void *m_Char_getIsDead, *m_Char_getCamp, *m_Char_Suicide;
-static void *m_Char_AddAbsInv, *m_Char_RemoveAbsInv, *m_Char_getIsInvincible;
+static void *m_Char_getIsDead, *m_Char_Suicide;
+static void *m_Char_AddAbsInv, *m_Char_RemoveAbsInv;
 static void *m_Char_AddStatus, *m_Char_RemoveStatus;
 static void *m_Char_getCurrentHp, *m_Char_setCurrentHp;
-static void *m_Char_getStatusMgr;
-// BattleManager
 static void *m_BM_AddExpAndGold, *m_BM_OnMissionClear, *m_BM_OnChapterEnd;
-static void *m_BM_CreateBattleEndEvent, *m_BM_GetCurWave, *m_BM_AddExBattleAttr;
-static void *m_BM_SetPlayerLevelAndExp, *m_BM_GetPlayerLevelAndExp;
-// BattleData
 static void *m_BD_AddUserExp, *m_BD_AddDropGold, *m_BD_AddWaveGold, *m_BD_AddDiamond;
-static void *m_BD_getGold, *m_BD_setGold, *m_BD_getPlayerExp;
-// ADModuleMgr / AdData
-static void *m_AD_CheckAndPlayVideo, *m_AD_TrackADReward, *m_AD_OnShow;
-static void *k_AD_onCloseField;
-static void *m_AdData_GetLeftAdCount;
-// CharacterStatusManager
-static void *m_CSM_AddCharacterStatus;
-// Game / GameManager (加速)
+static void *m_AD_CheckAndPlayVideo;
+static void *m_Ad_Show0;
 static void *m_GM_SetTimeScale, *m_Game_SetTimeScale;
-static void *m_Game_getCoreMgr;
-// GorillaAd.Runtime (免广告)
-static void *m_Ad_Show0 = NULL;     // LocalRewardedVideoAd.Show() 无参
-static void *m_AdMan_Show7 = NULL;  // GorillaAdManager.Show(...) 7 参
-static Il2CppClass *k_Ad_Local = NULL;
+static void *m_UO_FindObjectOfType;
 
-static int32_t off_CurLogicWorld = -1;   // WorldBattle.CurLogicWorld (static field)
-static int32_t off_BLW_worldCtx   = -1;  // BattleLogicWorld._worldContext
-static int32_t off_Ctx_gameSpeed  = -1;  // BattleWorldContext.gameSpeed
-static int32_t off_World_timeScale= -1;  // WorldBattle._curTimeScale
-static int32_t off_AD_onClose     = -1;  // ADModuleMgr._onClose
+static int32_t off_CurLogicWorld = -1;
+static int32_t off_BLW_worldCtx   = -1;
+static int32_t off_Ctx_gameSpeed  = -1;
+static int32_t off_World_timeScale= -1;
+static int32_t off_AD_onClose     = -1;
 
 static BOOL g_parsed = NO;
-static void *g_worldCache = NULL;        // WorldBattle 实例缓存
+static void *g_worldCache = NULL;
 
 static int32_t foff(Il2CppClass *k, const char *name) {
-    if (!k || !I.class_get_field_from_name) return -1;
-    Il2CppFieldInfo *f = I.class_get_field_from_name(k, name);
-    if (!f || !I.field_get_offset) return -1;
-    return (int32_t)I.field_get_offset(f);
+    if (!k || !I.class_get_field_from_name || !I.field_get_offset) return -1;
+    int32_t r = -1;
+    if (DK_GUARD_BEGIN() == 0) {
+        Il2CppFieldInfo *f = I.class_get_field_from_name(k, name);
+        if (f) r = (int32_t)I.field_get_offset(f);
+    }
+    DK_GUARD_END();
+    return r;
 }
 
-static void *ic_class(const char *img, const char *ns, const char *name) {
-    Il2CppImage im = NULL;
-    if (!strcmp(img, "HotFix"))        im = g_imgHF;
-    else if (!strcmp(img, "HotFixBattle")) im = g_imgHFB;
-    else if (!strcmp(img, "mscorlib")) im = g_imgCOR;
-    if (!im) return NULL;
-    return I.class_from_name(im, ns, name);
+static void *mof(Il2CppClass *k, const char *name, int argc) {
+    if (!k || !I.class_get_method_from_name) return NULL;
+    void *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) r = I.class_get_method_from_name(k, name, argc);
+    DK_GUARD_END();
+    return r;
 }
 
-// ───────────────────── 阶段A: 后台线程解析 ─────────────────────
-static BOOL resolve_try(void) {
-    if (!ic_ready) return NO;
-    if (!g_imgHF)  g_imgHF  = ic_find_image("HotFix.dll");
-    if (!g_imgHFB) g_imgHFB = ic_find_image("HotFixBattle.dll");
-    if (!g_imgCOR) g_imgCOR = ic_find_image("mscorlib.dll");
-    if (!g_imgHF || !g_imgHFB) {
-        static int n = 0; if (++n <= 5) L("A: img HotFix=%p HotFixBattle=%p (热更未加载?)", g_imgHF, g_imgHFB);
-        return NO;
-    }
-    k_BattleGame = ic_class("HotFix", "HotFix", "BattleGame");
-    k_WorldBattle= ic_class("HotFix", "HotFix", "WorldBattle");
-    k_BLW        = ic_class("HotFixBattle", "HotFix.BattleLogic", "BattleLogicWorld");
-    k_Ctx        = ic_class("HotFixBattle", "HotFix.BattleLogic", "BattleWorldContext");
-    k_EM         = ic_class("HotFixBattle", "HotFix.BattleLogic", "EntityManager");
-    k_Char       = ic_class("HotFixBattle", "HotFix.BattleLogic", "EntityCharacter");
-    k_Hero       = ic_class("HotFixBattle", "HotFix.BattleLogic", "EntityHero");
-    k_TDD        = ic_class("HotFixBattle", "HotFix.BattleLogic", "TakeDamageData");
-    k_BattleMgr  = ic_class("HotFixBattle", "HotFix.BattleLogic", "BattleManager");
-    k_BattleData = ic_class("HotFixBattle", "HotFix.BattleLogic", "BattleData");
-    k_ADMgr      = ic_class("HotFix", "HotFix", "ADModuleMgr");
-    k_AdData     = ic_class("HotFix", "HotFix", "AdData");
-    k_I64        = ic_class("mscorlib", "System", "Int64");
-    k_Game       = ic_class("HotFix", "HotFix", "Game");
-    k_GameMgr    = ic_class("HotFix", "HotFix", "GameManager");
-    if (!k_BattleGame || !k_WorldBattle || !k_Ctx || !k_Char) {
-        static int n2 = 0;
-        if (++n2 <= 5) L("A: 类缺失 BG=%p WB=%p CTX=%p Char=%p BLW=%p",
-                         k_BattleGame, k_WorldBattle, k_Ctx, k_Char, k_BLW);
-        return NO;
-    }
-    m_BG_getWorld      = I.class_get_method_from_name(k_BattleGame, "get_World", 0);
-    m_WB_getLogicWorld = I.class_get_method_from_name(k_WorldBattle, "get_LogicWorld", 0);
-    m_WB_StopTime      = I.class_get_method_from_name(k_WorldBattle, "StopTime", 0);
-    m_WB_ResetTime     = I.class_get_method_from_name(k_WorldBattle, "ResetTime", 0);
-    m_WB_SetLevel      = I.class_get_method_from_name(k_WorldBattle, "SetLevel", 1);
+static Il2CppClass *cn(Il2CppImage img, const char *ns, const char *name) {
+    if (!img || !I.class_from_name) return NULL;
+    Il2CppClass *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) r = I.class_from_name(img, ns, name);
+    DK_GUARD_END();
+    return r;
+}
 
-    m_Ctx_getEntity    = k_Ctx ? I.class_get_method_from_name(k_Ctx, "get_Entity", 0) : NULL;
-    m_Ctx_getBattleMgr = k_Ctx ? I.class_get_method_from_name(k_Ctx, "get_BattleMgr", 0) : NULL;
-    m_Ctx_getBattleData= k_Ctx ? I.class_get_method_from_name(k_Ctx, "get_BattleData", 0) : NULL;
+// ── 分步状态机 ──
+enum { RS_WAIT_DOMAIN = 0, RS_HF, RS_HFB, RS_AD, RS_COR, RS_C1, RS_C2, RS_C3,
+       RS_M1, RS_M2, RS_M3, RS_M4, RS_OFF, RS_DONE, RS_FAIL };
+static int g_rs = RS_WAIT_DOMAIN;
+static int g_rsTick = 0;
+static int g_rsFails = 0;
 
-    if (k_EM) {
-        m_EM_GetEntityValues = I.class_get_method_from_name(k_EM, "GetEntityValues", 0);
-        m_EM_GetAllPlayer    = I.class_get_method_from_name(k_EM, "GetAllPlayer", 0);
-        m_EM_GetPlayer       = I.class_get_method_from_name(k_EM, "GetPlayer", 1);
-    }
-    if (k_Char) {
-        m_Char_SetHp         = I.class_get_method_from_name(k_Char, "SetHp", 1);
-        m_Char_GetHp         = I.class_get_method_from_name(k_Char, "GetHp", 0);
-        m_Char_OnDeath       = I.class_get_method_from_name(k_Char, "OnDeath", 1);
-        m_Char_UpdateHp      = I.class_get_method_from_name(k_Char, "UpdateHp", 1);
-        m_Char_getIsDead     = I.class_get_method_from_name(k_Char, "get_IsDead", 0);
-        m_Char_Suicide       = I.class_get_method_from_name(k_Char, "Suicide", 1);
-        m_Char_AddAbsInv     = I.class_get_method_from_name(k_Char, "AddAbsoluteInvincibility", 0);
-        m_Char_RemoveAbsInv  = I.class_get_method_from_name(k_Char, "RemoveAbsoluteInvincibility", 0);
-        m_Char_getIsInvincible = I.class_get_method_from_name(k_Char, "get_IsInvincible", 0);
-        m_Char_AddStatus     = I.class_get_method_from_name(k_Char, "AddCharacterStatus", 1);
-        m_Char_RemoveStatus  = I.class_get_method_from_name(k_Char, "RemoveCharacterStatus", 1);
-        m_Char_getCurrentHp  = I.class_get_method_from_name(k_Char, "get_CurrentHp", 0);
-        m_Char_setCurrentHp  = I.class_get_method_from_name(k_Char, "set_CurrentHp", 1);
-    }
-    if (k_BattleMgr) {
-        m_BM_AddExpAndGold   = I.class_get_method_from_name(k_BattleMgr, "AddExpAndGold", 0);
-        m_BM_OnMissionClear  = I.class_get_method_from_name(k_BattleMgr, "OnMissionClear", 0);
-        m_BM_OnChapterEnd    = I.class_get_method_from_name(k_BattleMgr, "OnChapterEnd", 0);
-        m_BM_GetCurWave      = I.class_get_method_from_name(k_BattleMgr, "GetCurWave", 0);
-    }
-    if (k_BattleData) {
-        m_BD_AddUserExp      = I.class_get_method_from_name(k_BattleData, "AddUserExp", 1);
-        m_BD_AddDropGold     = I.class_get_method_from_name(k_BattleData, "AddDropGold", 1);
-        m_BD_AddWaveGold     = I.class_get_method_from_name(k_BattleData, "AddWaveGold", 1);
-        m_BD_AddDiamond      = I.class_get_method_from_name(k_BattleData, "AddDiamond", 1);
-        m_BD_getGold         = I.class_get_method_from_name(k_BattleData, "get_Gold", 0);
-        m_BD_setGold         = I.class_get_method_from_name(k_BattleData, "set_Gold", 1);
-        m_BD_getPlayerExp    = I.class_get_method_from_name(k_BattleData, "get_PlayerExp", 0);
-    }
-    if (k_ADMgr) {
-        m_AD_CheckAndPlayVideo = I.class_get_method_from_name(k_ADMgr, "CheckAndPlayVideo", 2);
-        m_AD_TrackADReward     = I.class_get_method_from_name(k_ADMgr, "TrackADReward", 5);
-        m_AD_OnShow            = I.class_get_method_from_name(k_ADMgr, "OnShow", 0);
-    }
-    if (k_AdData) {
-        m_AdData_GetLeftAdCount = I.class_get_method_from_name(k_AdData, "GetLeftAdCount", 1);
-    }
-    if (k_GameMgr) m_GM_SetTimeScale   = I.class_get_method_from_name(k_GameMgr, "SetTimeScale", 1);
-    if (k_Game)    m_Game_SetTimeScale = I.class_get_method_from_name(k_Game, "SetTimeScale", 1);
-    // GorillaAd: LocalRewardedVideoAd.Show() 无参 (绕过 SDK, 直接发奖)
-    Il2CppImage imAd = ic_find_image("GorillaAd.Runtime.dll");
-    if (imAd) {
-        k_Ad_Local = I.class_from_name(imAd, "GorillaAd.Runtime", "LocalRewardedVideoAd");
-        if (k_Ad_Local) {
-            m_Ad_Show0 = I.class_get_method_from_name(k_Ad_Local, "Show", 0);
+static void rs_log(const char *stage, BOOL ok) {
+    L("A[%s] %s", stage, ok ? "✓" : "✗");
+}
+
+// 每个 tick 推进一小步 (每步最多 1~4 次安全调用)
+static void resolve_step(void) {
+    if (g_parsed || g_rs == RS_DONE || g_rs == RS_FAIL) return;
+    if (++g_rsTick < 3) return;      // 每 3 个 tick (≈1.2s) 走一步
+    g_rsTick = 0;
+
+    switch (g_rs) {
+    case RS_WAIT_DOMAIN:
+        if (ic_domain_ready()) { g_rs = RS_HF; L("A[domain] ✓ il2cpp 域就绪"); }
+        else if (++g_rsFails > 400) { g_rs = RS_FAIL; L("A[domain] ✗ 超时"); }
+        return;
+    case RS_HF:
+        g_imgHF = ic_find_image("HotFix.dll");
+        rs_log("HotFix.dll", g_imgHF != NULL);
+        if (g_imgHF) { g_rs = RS_HFB; g_rsFails = 0; }
+        else if (++g_rsFails > 200) { g_rs = RS_FAIL; }
+        return;
+    case RS_HFB:
+        g_imgHFB = ic_find_image("HotFixBattle.dll");
+        rs_log("HotFixBattle.dll", g_imgHFB != NULL);
+        if (g_imgHFB) { g_rs = RS_AD; g_rsFails = 0; }
+        else if (++g_rsFails > 200) { g_rs = RS_FAIL; }
+        return;
+    case RS_AD:
+        g_imgAD = ic_find_image("GorillaAd.Runtime.dll");
+        L("A[GorillaAd] %s", g_imgAD ? "✓" : "✗ (可缺)");
+        g_rs = RS_COR; return;
+    case RS_COR:
+        g_imgCOR = ic_find_image("mscorlib.dll");
+        L("A[mscorlib] %s", g_imgCOR ? "✓" : "✗ (可缺)");
+        g_rs = RS_C1; return;
+    case RS_C1:
+        k_BattleGame  = cn(g_imgHF, "HotFix", "BattleGame");
+        k_WorldBattle = cn(g_imgHF, "HotFix", "WorldBattle");
+        k_BLW         = cn(g_imgHFB, "HotFix.BattleLogic", "BattleLogicWorld");
+        k_Ctx         = cn(g_imgHFB, "HotFix.BattleLogic", "BattleWorldContext");
+        L("A[C1] BG=%p WB=%p BLW=%p CTX=%p", k_BattleGame, k_WorldBattle, k_BLW, k_Ctx);
+        if (k_BattleGame && k_WorldBattle && k_Ctx) g_rs = RS_C2;
+        else if (++g_rsFails > 60) { g_rs = RS_FAIL; L("A[C1] ✗ 类缺失"); }
+        return;
+    case RS_C2:
+        k_EM   = cn(g_imgHFB, "HotFix.BattleLogic", "EntityManager");
+        k_Char = cn(g_imgHFB, "HotFix.BattleLogic", "EntityCharacter");
+        k_Hero = cn(g_imgHFB, "HotFix.BattleLogic", "EntityHero");
+        k_TDD  = cn(g_imgHFB, "HotFix.BattleLogic", "TakeDamageData");
+        L("A[C2] EM=%p Char=%p Hero=%p TDD=%p", k_EM, k_Char, k_Hero, k_TDD);
+        if (k_Char) g_rs = RS_C3; else if (++g_rsFails > 60) g_rs = RS_FAIL;
+        return;
+    case RS_C3:
+        k_BattleMgr  = cn(g_imgHFB, "HotFix.BattleLogic", "BattleManager");
+        k_BattleData = cn(g_imgHFB, "HotFix.BattleLogic", "BattleData");
+        k_ADMgr      = cn(g_imgHF, "HotFix", "ADModuleMgr");
+        k_AdData     = cn(g_imgHF, "HotFix", "AdData");
+        k_Game       = cn(g_imgHF, "HotFix", "Game");
+        k_GameMgr    = cn(g_imgHF, "HotFix", "GameManager");
+        k_I64        = cn(g_imgCOR, "System", "Int64");
+        L("A[C3] BM=%p BD=%p ADMgr=%p Game=%p GM=%p I64=%p",
+          k_BattleMgr, k_BattleData, k_ADMgr, k_Game, k_GameMgr, k_I64);
+        g_rs = RS_M1; return;
+    case RS_M1:
+        m_BG_getWorld      = mof(k_BattleGame, "get_World", 0);
+        m_WB_getLogicWorld = mof(k_WorldBattle, "get_LogicWorld", 0);
+        m_Ctx_getEntity    = mof(k_Ctx, "get_Entity", 0);
+        m_Ctx_getBattleMgr = mof(k_Ctx, "get_BattleMgr", 0);
+        m_Ctx_getBattleData= mof(k_Ctx, "get_BattleData", 0);
+        L("A[M1] getWorld=%p logicWorld=%p ctxEntity=%p", m_BG_getWorld, m_WB_getLogicWorld, m_Ctx_getEntity);
+        g_rs = RS_M2; return;
+    case RS_M2:
+        if (k_EM) {
+            m_EM_GetEntityValues    = mof(k_EM, "GetEntityValues", 0);
+            m_EM_GetAllPlayer       = mof(k_EM, "GetAllPlayer", 0);
+            m_EM_GetPlayer          = mof(k_EM, "GetPlayer", 1);
+            m_EM_EnemyCommitSuicide = mof(k_EM, "EnemyCommitSuicide", 2);
         }
-        Il2CppClass *kAdMan = I.class_from_name(imAd, "GorillaAd.Runtime", "GorillaAdManager");
-        if (kAdMan) {
-            m_AdMan_Show7 = I.class_get_method_from_name(kAdMan, "Show", 7);
-            if (!m_AdMan_Show7) m_AdMan_Show7 = I.class_get_method_from_name(kAdMan, "Show", 8);
+        if (k_Char) {
+            m_Char_SetHp        = mof(k_Char, "SetHp", 1);
+            m_Char_GetHp        = mof(k_Char, "GetHp", 0);
+            m_Char_OnDeath      = mof(k_Char, "OnDeath", 1);
+            m_Char_getIsDead    = mof(k_Char, "get_IsDead", 0);
+            m_Char_Suicide      = mof(k_Char, "Suicide", 1);
+            m_Char_AddAbsInv    = mof(k_Char, "AddAbsoluteInvincibility", 0);
+            m_Char_RemoveAbsInv = mof(k_Char, "RemoveAbsoluteInvincibility", 0);
+            m_Char_AddStatus    = mof(k_Char, "AddCharacterStatus", 1);
+            m_Char_getCurrentHp = mof(k_Char, "get_CurrentHp", 0);
+            m_Char_setCurrentHp = mof(k_Char, "set_CurrentHp", 1);
         }
-        L("A: GorillaAd LocalRewardedVideoAd=%p Show0=%p AdManager.ShowN=%p",
-          k_Ad_Local, m_Ad_Show0, m_AdMan_Show7);
-    } else {
-        L("A: GorillaAd.Runtime.dll image 未找到");
+        L("A[M2] vals=%p allPlayer=%p suicide=%p SetHp=%p OnDeath=%p absInv=%p status=%p",
+          m_EM_GetEntityValues, m_EM_GetAllPlayer, m_EM_EnemyCommitSuicide,
+          m_Char_SetHp, m_Char_OnDeath, m_Char_AddAbsInv, m_Char_AddStatus);
+        g_rs = RS_M3; return;
+    case RS_M3:
+        if (k_BattleMgr) {
+            m_BM_AddExpAndGold  = mof(k_BattleMgr, "AddExpAndGold", 0);
+            m_BM_OnMissionClear = mof(k_BattleMgr, "OnMissionClear", 0);
+            m_BM_OnChapterEnd   = mof(k_BattleMgr, "OnChapterEnd", 0);
+        }
+        if (k_BattleData) {
+            m_BD_AddUserExp   = mof(k_BattleData, "AddUserExp", 1);
+            m_BD_AddDropGold  = mof(k_BattleData, "AddDropGold", 1);
+            m_BD_AddWaveGold  = mof(k_BattleData, "AddWaveGold", 1);
+        }
+        L("A[M3] expAndGold=%p missionClear=%p AddUserExp=%p AddDropGold=%p",
+          m_BM_AddExpAndGold, m_BM_OnMissionClear, m_BD_AddUserExp, m_BD_AddDropGold);
+        g_rs = RS_M4; return;
+    case RS_M4:
+        if (k_ADMgr) {
+            m_AD_CheckAndPlayVideo = mof(k_ADMgr, "CheckAndPlayVideo", 2);
+            off_AD_onClose = foff(k_ADMgr, "_onClose");
+        }
+        if (k_GameMgr) m_GM_SetTimeScale   = mof(k_GameMgr, "SetTimeScale", 1);
+        if (k_Game)    m_Game_SetTimeScale = mof(k_Game, "SetTimeScale", 1);
+        if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
+        L("A[M4] adPlay=%p adOnClose@0x%x GM=%p Game=%p adShow0=%p",
+          m_AD_CheckAndPlayVideo, off_AD_onClose, m_GM_SetTimeScale, m_Game_SetTimeScale, m_Ad_Show0);
+        g_rs = RS_OFF; return;
+    case RS_OFF:
+        off_CurLogicWorld   = foff(k_WorldBattle, "CurLogicWorld");
+        off_BLW_worldCtx    = foff(k_BLW, "_worldContext");
+        off_Ctx_gameSpeed   = foff(k_Ctx, "gameSpeed");
+        off_World_timeScale = foff(k_WorldBattle, "_curTimeScale");
+        if (g_imgAD && !k_Ad_Local)
+            k_Ad_Local = cn(g_imgAD, "GorillaAd.Runtime", "LocalRewardedVideoAd");
+        if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
+        L("A[OFF] curLogicWorld=0x%x worldCtx=0x%x gameSpeed=0x%x timeScale=0x%x",
+          off_CurLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale);
+        // 入口可用性判定
+        if (!m_BG_getWorld && off_CurLogicWorld <= 0) {
+            L("A ✗ 无可用世界入口 → 功能不可用");
+            g_rs = RS_FAIL; return;
+        }
+        g_parsed = YES;
+        g_rs = RS_DONE;
+        L("A ✓✓ 解析完成 — 进入关卡后功能生效");
+        {
+            NSString *doc = dk_doc_path();
+            if (doc) {
+                NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+                [ud setInteger:0 forKey:@"dk3_crashStreak"];
+                [ud synchronize];
+            }
+        }
+        return;
+    case RS_DONE: case RS_FAIL: default: return;
     }
-    // 偏移
-    off_CurLogicWorld = foff(k_WorldBattle, "CurLogicWorld");
-    off_BLW_worldCtx  = foff(k_BLW, "_worldContext");
-    off_Ctx_gameSpeed = foff(k_Ctx, "gameSpeed");
-    off_World_timeScale = foff(k_WorldBattle, "_curTimeScale");
-    off_AD_onClose    = foff(k_ADMgr, "_onClose");
-    k_AD_onCloseField = (k_ADMgr && I.class_get_field_from_name)
-                      ? I.class_get_field_from_name(k_ADMgr, "_onClose") : NULL;
+}
 
-    if (!m_BG_getWorld && !off_CurLogicWorld) {
-        static int n3 = 0; if (++n3 <= 3) L("A: 入口缺失 getWorld=%p CurLogicWorld=0x%x",
-                                            m_BG_getWorld, off_CurLogicWorld);
-        return NO;
+// ── 世界实例获取 ──
+static void *ic_find_image_safe(const char *want) {
+    if (!ic_ready || !ic_domain_ready()) return NULL;
+    if (!I.domain_get_assemblies || !I.assembly_get_image) return NULL;
+    void *r = NULL;
+    if (DK_GUARD_BEGIN() == 0) {
+        size_t n = 0;
+        void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
+        if (asms && n < 4096) {
+            for (size_t i = 0; i < n; i++) {
+                if (!asms[i]) continue;
+                Il2CppImage img = I.assembly_get_image(asms[i]);
+                if (!img) continue;
+                const char *nm = I.image_get_name ? I.image_get_name(img) : NULL;
+                if (nm && !strcmp(nm, want)) { r = img; break; }
+            }
+        }
     }
-    g_parsed = YES;
-    L("A ✓ 解析完成 | getWorld=%p logicWorld=%p ctx@0x%x spd@0x%x tscale@0x%x",
-      m_BG_getWorld, m_WB_getLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale);
-    L("   Char: SetHp=%p OnDeath=%p IsDead=%p AbsInv=%p AddStatus=%p CurHp=%p/%p",
-      m_Char_SetHp, m_Char_OnDeath, m_Char_getIsDead, m_Char_AddAbsInv, m_Char_AddStatus,
-      m_Char_getCurrentHp, m_Char_setCurrentHp);
-    L("   BM: AddExpAndGold=%p OnMissionClear=%p | BD: AddUserExp=%p AddDropGold=%p AddWaveGold=%p",
-      m_BM_AddExpAndGold, m_BM_OnMissionClear, m_BD_AddUserExp, m_BD_AddDropGold, m_BD_AddWaveGold);
-    L("   AD: CheckAndPlayVideo=%p onClose@0x%x leftAd=%p", m_AD_CheckAndPlayVideo, off_AD_onClose, m_AdData_GetLeftAdCount);
-    return YES;
-}
-
-
-// ───────────────────── 扩展 il2cpp API (类型对象/虚调用) ─────────────────────
-// 追加到 dk_il2cpp_t 的能力（用独立函数指针，避免改动结构体定义）
-typedef void* (*ic_class_get_type_fn)(Il2CppClass *);
-typedef void* (*ic_type_get_object_fn)(void *);
-typedef void* (*ic_object_new_fn)(Il2CppClass *);
-typedef void* (*ic_class_get_static_field_data_fn)(Il2CppClass *);
-
-static ic_class_get_type_fn            p_class_get_type;
-static ic_type_get_object_fn           p_type_get_object;
-static ic_class_get_static_field_data_fn p_static_field_data;
-
-static void ic_init_ext(void) {
-    p_class_get_type      = (ic_class_get_type_fn)dk_sym_find("_il2cpp_class_get_type");
-    p_type_get_object     = (ic_type_get_object_fn)dk_sym_find("_il2cpp_type_get_object");
-    p_static_field_data   = (ic_class_get_static_field_data_fn)dk_sym_find("_il2cpp_class_get_static_field_data");
-    L("ic-ext: class_get_type=%p type_get_object=%p static_field_data=%p",
-      p_class_get_type, p_type_get_object, p_static_field_data);
-}
-
-// 把 Il2CppClass 转成 System.Type 对象 (FindObjectOfType 需要)
-static void *ic_type_of(Il2CppClass *k) {
-    if (!k || !p_class_get_type || !p_type_get_object) return NULL;
-    void *t = p_class_get_type(k);
-    return t ? p_type_get_object(t) : NULL;
-}
-
-// ───────────────────── 虚调用: 按【运行时实际类】解析方法 ─────────────────────
-// ⚠️ 关键: 基类 MethodInfo 调用虚方法在派生实例上可能不生效 (热更/覆写) →
-//    一律用 object_get_class 拿运行时类再查方法, 命中覆写版。
-static void *vmi(void *obj, const char *name, int argc) {
-    if (!obj || !I.object_get_class || !I.class_get_method_from_name) return NULL;
-    Il2CppClass *rc = (Il2CppClass *)I.object_get_class(obj);
-    if (!rc) return NULL;
-    void *m = I.class_get_method_from_name(rc, name, argc);
-    if (m) return m;
-    // 沿父链回溯 (最多 8 层)
-    Il2CppClass *c = rc;
-    for (int i = 0; i < 8 && c; i++) {
-        c = I.class_get_parent ? (Il2CppClass *)I.class_get_parent(c) : NULL;
-        if (!c) break;
-        m = I.class_get_method_from_name(c, name, argc);
-        if (m) return m;
-    }
-    return NULL;
-}
-
-static void *vcall(void *obj, const char *name, int argc, void **args) {
-    void *m = vmi(obj, name, argc);
-    if (!m) return NULL;
-    return ic_call(m, obj, args);
-}
-
-static BOOL vis_obj(void *obj, const char *name, int argc, void **args) {
-    void *m = vmi(obj, name, argc);
-    if (!m) return NO;
-    Il2CppObject *r = ic_call(m, obj, args);
-    if (!r) return NO;
-    return *(uint8_t *)((uint8_t *)r + 0x10) ? YES : NO;
-}
-
-static int64_t vig_i64(void *obj, const char *name, int argc, void **args) {
-    void *m = vmi(obj, name, argc);
-    if (!m) return 0;
-    Il2CppObject *r = ic_call(m, obj, args);
-    return r ? *(int64_t *)((uint8_t *)r + 0x10) : 0;
-}
-
-static int32_t vig_i32(void *obj, const char *name, int argc, void **args) {
-    void *m = vmi(obj, name, argc);
-    if (!m) return 0;
-    Il2CppObject *r = ic_call(m, obj, args);
-    return r ? *(int32_t *)((uint8_t *)r + 0x10) : 0;
-}
-
-// 判断对象是否为某类实例
-static BOOL is_inst_of(void *obj, Il2CppClass *k) {
-    if (!obj || !k || !I.object_get_class || !I.class_is_assignable_from) return NO;
-    Il2CppClass *rc = (Il2CppClass *)I.object_get_class(obj);
-    return rc ? (I.class_is_assignable_from(k, rc) ? YES : NO) : NO;
-}
-
-// ───────────────────── 世界实例获取 (多路兜底) ─────────────────────
-// ① BattleGame.get_World()               (static, 最稳)
-// ② UnityEngine.Object.FindObjectOfType(BattleGame) → get_World()  (MonoBehaviour 场景实例)
-// ③ WorldBattle.CurLogicWorld 静态字段存在性探测 (间接确认世界已创建)
-// (g_worldCache 已在 part3 声明)
-static void *m_UO_FindObjectOfType = NULL;   // UnityEngine.Object.FindObjectOfType(Type)
-static Il2CppClass *k_UObject = NULL;
-
-static void resolve_world_gate(void) {
-    if (m_UO_FindObjectOfType) return;
-    Il2CppImage im = ic_find_image("UnityEngine.CoreModule.dll");
-    if (!im) im = ic_find_image("UnityEngine.dll");
-    if (!im) return;
-    k_UObject = I.class_from_name(im, "UnityEngine", "Object");
-    if (!k_UObject) return;
-    // FindObjectOfType 有多个重载 (Type) / (Type,bool) / 泛型; 取 1 参版
-    m_UO_FindObjectOfType = I.class_get_method_from_name(k_UObject, "FindObjectOfType", 1);
-    L("world: UnityEngine.Object=%p FindObjectOfType(1)=%p", k_UObject, m_UO_FindObjectOfType);
+    DK_GUARD_END();
+    return r;
 }
 
 static void *get_world(void) {
     if (!g_parsed) return NULL;
-    // ① 静态属性 BattleGame.get_World()
     if (m_BG_getWorld) {
-        void *w = ic_call(m_BG_getWorld, NULL, NULL);
+        void *w = NULL;
+        if (DK_GUARD_BEGIN() == 0) w = ic_call(m_BG_getWorld, NULL, NULL);
+        DK_GUARD_END();
         if (w) { g_worldCache = w; return w; }
-    }
-    // ② FindObjectOfType(BattleGame).get_World()
-    if (!m_UO_FindObjectOfType) resolve_world_gate();
-    if (m_UO_FindObjectOfType && k_BattleGame && p_class_get_type && p_type_get_object) {
-        void *typeObj = ic_type_of(k_BattleGame);
-        if (typeObj) {
-            void *args[1] = { typeObj };
-            Il2CppObject *bg = ic_call(m_UO_FindObjectOfType, NULL, args);
-            if (bg) {
-                void *w = vcall(bg, "get_World", 0, NULL);
-                if (!w && I.class_get_method_from_name) {
-                    void *m = I.class_get_method_from_name(k_BattleGame, "get_World", 0);
-                    if (m) w = ic_call(m, bg, NULL);
-                }
-                if (w) { g_worldCache = w; 
-                    static int l1 = 0; if (++l1 <= 2) L("world: 走 FindObjectOfType 取得 %p", w);
-                    return w;
-                }
-            }
-        }
     }
     return g_worldCache;
 }
 
 static void *get_logic_world(void *world) {
     if (!world) return NULL;
-    // ① 实例方法 get_LogicWorld()
-    void *blw = vcall(world, "get_LogicWorld", 0, NULL);
-    if (blw) return blw;
-    // ② 静态字段 CurLogicWorld (offset 命中时)
+    if (m_WB_getLogicWorld) {
+        void *b = NULL;
+        if (DK_GUARD_BEGIN() == 0) b = ic_call(m_WB_getLogicWorld, world, NULL);
+        DK_GUARD_END();
+        if (b) return b;
+    }
     if (off_CurLogicWorld > 0) {
-        void *p = *(void **)((uint8_t *)world + off_CurLogicWorld);
-        if (p) return p;
+        void *b = *(void **)((uint8_t *)world + off_CurLogicWorld);
+        if (b) return b;
     }
     return NULL;
 }
@@ -752,53 +577,52 @@ static void *get_ctx(void) {
     void *world = get_world();
     if (!world) return NULL;
     void *blw = get_logic_world(world);
-    if (!blw) return NULL;
-    if (off_BLW_worldCtx > 0) {
-        void *ctx = *(void **)((uint8_t *)blw + off_BLW_worldCtx);
-        if (ctx) return ctx;
-    }
-    return NULL;
+    if (!blw || off_BLW_worldCtx <= 0) return NULL;
+    return *(void **)((uint8_t *)blw + off_BLW_worldCtx);
 }
 
 static void *ctx_entity(void *ctx)     { return (ctx && m_Ctx_getEntity)     ? ic_call(m_Ctx_getEntity, ctx, NULL)     : NULL; }
 static void *ctx_battlemgr(void *ctx)  { return (ctx && m_Ctx_getBattleMgr)  ? ic_call(m_Ctx_getBattleMgr, ctx, NULL)  : NULL; }
 static void *ctx_battledata(void *ctx) { return (ctx && m_Ctx_getBattleData) ? ic_call(m_Ctx_getBattleData, ctx, NULL) : NULL; }
 
-// GameManager 实例: HotFix.Singleton`1<GameManager>.get_Instance (static)
-static void *g_gmCache = NULL;
-static void *get_gamemanager(void) {
-    if (g_gmCache) return g_gmCache;
-    if (!k_GameMgr) return NULL;
-    // Singleton`1 泛型实例类的静态 get_Instance; 具体实例类名可能是 GameManager 自身
-    void *mi = I.class_get_method_from_name(k_GameMgr, "get_Instance", 0);
-    if (!mi && I.class_get_fields) {
-        // GameManager 若有静态字段 (Singleton.m_t) 也可直接读
+static BOOL battle_alive(void) {
+    void *w = get_world();
+    if (!w) return NO;
+    if (!get_logic_world(w)) return NO;
+    return get_ctx() ? YES : NO;
+}
+
+// 虚方法: 按运行时类解析
+static void *vmi(void *obj, const char *name, int argc) {
+    if (!obj || !I.object_get_class || !I.class_get_method_from_name) return NULL;
+    Il2CppClass *rc = NULL;
+    if (DK_GUARD_BEGIN() == 0) rc = (Il2CppClass *)I.object_get_class(obj);
+    DK_GUARD_END();
+    if (!rc) return NULL;
+    void *m = mof(rc, name, argc);
+    if (m) return m;
+    Il2CppClass *c = rc;
+    for (int i = 0; i < 8 && c; i++) {
+        c = I.class_get_parent ? (Il2CppClass *)I.class_get_parent(c) : NULL;
+        if (!c) break;
+        m = mof(c, name, argc);
+        if (m) return m;
     }
-    if (mi) {
-        Il2CppObject *o = ic_call(mi, NULL, NULL);
-        if (o) { g_gmCache = o; L("GameManager.Instance = %p", o); return o; }
-    }
-    static int l = 0; if (++l <= 2) L("GameManager.get_Instance 未命中 (mi=%p)", mi);
     return NULL;
 }
 
-static BOOL battle_alive(void) {
-    void *world = get_world();
-    if (!world) return NO;
-    if (!get_logic_world(world)) return NO;
-    if (!get_ctx()) return NO;
-    return YES;
+static BOOL is_inst_of(void *obj, Il2CppClass *k) {
+    if (!obj || !k || !I.object_get_class || !I.class_is_assignable_from) return NO;
+    BOOL r = NO;
+    if (DK_GUARD_BEGIN() == 0) {
+        Il2CppClass *rc = (Il2CppClass *)I.object_get_class(obj);
+        if (rc) r = I.class_is_assignable_from(k, rc) ? YES : NO;
+    }
+    DK_GUARD_END();
+    return r;
 }
 
-// ───────────────────── 通用 MethodInfo 热替换 (零 __TEXT patch) ─────────────────────
-// 原理: il2cpp MethodInfo 里的 methodPointer 是【数据段函数指针】, 改写它
-//       不影响代码段、无需 mprotect 代码页、无 icache 风险。
-//       HybridCLR 解释器执行 call 时会读取该指针 → 替换对热更方法同样生效。
-// ⚠️ 不采用 inline hook: arm64 序言含 ADRP/ADD 等 PC 相对指令, 覆写极易踩雷。
-//
-// MethodInfo 布局 (il2cpp v31, arm64) 实测探测:
-//   name 字段: 用 method_get_name() 返回指针做【指针相等】比较定位
-//   methodPointer: 首个落在 UnityFramework __TEXT 范围的指针
+// ───────────────────── 通用 MethodInfo 热替换 (数据段, 零 __TEXT patch) ─────────────────────
 typedef struct {
     uintptr_t  *slot;
     uintptr_t   orig;
@@ -810,16 +634,16 @@ typedef struct {
 static dk_hook_rec_t g_hooks[8];
 static int g_hookN = 0;
 
-static int ptr_eq_cstr(uintptr_t v, const char *want) {
+static int ptr_is_cstr(uintptr_t v, const char *want) {
     if (!v || !want || v < 0x1000) return 0;
     int ok = 0;
     if (DK_GUARD_BEGIN() == 0) {
         const char *s = (const char *)v;
-        ok = (s == want) ? 1 : ((-(intptr_t)1));
-        if (!ok) ok = (strcmp(s, want) == 0) ? 2 : 0;
+        if (s == want) ok = 1;
+        else if (strcmp(s, want) == 0) ok = 1;
     }
     DK_GUARD_END();
-    return (ok == -1) ? 1 : ok;
+    return ok;
 }
 
 static uintptr_t *find_methodptr_slot(void *mi, const char *tag) {
@@ -831,14 +655,14 @@ static uintptr_t *find_methodptr_slot(void *mi, const char *tag) {
         for (int off = 0; off <= 96; off += 8) {
             uintptr_t v = *(uintptr_t *)(p + off);
             if (!v) continue;
-            if (nameOff < 0 && want && ptr_eq_cstr(v, want)) { nameOff = off; continue; }
+            if (nameOff < 0 && want && ptr_is_cstr(v, want)) { nameOff = off; continue; }
             if (ptrOff < 0 && dk_ptr_executable(v)) ptrOff = off;
         }
     }
     DK_GUARD_END();
     if (ptrOff < 0) { L("hook[%s]: methodPointer 未定位 (nameOff=%d)", tag, nameOff); return NULL; }
-    if (nameOff < 0 && want) L("hook[%s]: ⚠️ name 字段未命中, methodPointer@%d", tag, ptrOff);
-    L("hook[%s]: name@%d methodPointer@%d (name=%s)", tag, nameOff, ptrOff, want ? want : "?");
+    if (nameOff < 0 && want) L("hook[%s]: ⚠️ name 未命中 methodPointer@%d", tag, ptrOff);
+    else L("hook[%s]: name@%d methodPointer@%d (%s)", tag, nameOff, ptrOff, want ? want : "?");
     return (uintptr_t *)(p + ptrOff);
 }
 
@@ -846,11 +670,10 @@ static void *dk_hook_method(void *mi, void *replacement, const char *tag) {
     if (!mi || !replacement || g_hookN >= 8) return NULL;
     uintptr_t *slot = find_methodptr_slot(mi, tag);
     if (!slot) return NULL;
-    // 直接对该页放开写权限 (失败仅警告)
     vm_address_t pg = (vm_address_t)((uintptr_t)slot & ~(uintptr_t)(vm_page_size - 1));
     kern_return_t kr = vm_protect(mach_task_self(), pg, vm_page_size, FALSE,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) L("hook[%s]: vm_protect rwx kr=%d (直接写试)", tag, kr);
+    if (kr != KERN_SUCCESS) L("hook[%s]: vm_protect rwx kr=%d", tag, kr);
     g_hooks[g_hookN].slot = slot;
     g_hooks[g_hookN].orig = *slot;
     g_hooks[g_hookN].mi   = mi;
@@ -869,9 +692,9 @@ static void dk_unhook_all(void) {
     g_hookN = 0;
 }
 
-// ───────────────────── ⑤ 免广告实现 ─────────────────────
+// ───────────────────── ⑤ 免广告 ─────────────────────
 static int   g_adHooked = 0;
-static void *g_ad_mp_slot = NULL;      // 供日志引用
+static void *g_ad_mp_slot = NULL;
 
 static int looks_like_delegate(void *obj) {
     if (!obj || !I.object_get_class || !I.class_get_name) return 0;
@@ -906,7 +729,6 @@ static int delegate_invoke(void *obj) {
     return 1;
 }
 
-// ADModuleMgr.CheckAndPlayVideo(callback, source) 替换实现
 static void ad_replacement_2(void *self, void *a1, void *a2) {
     if (g_hookN > 0) g_hooks[0].hits++;
     static int l = 0;
@@ -918,10 +740,9 @@ static void ad_replacement_2(void *self, void *a1, void *a2) {
         void *d = *(void **)((uint8_t *)self + off_AD_onClose);
         if (d) fired += delegate_invoke(d);
     }
-    if (l <= 6) L("⑤ noAd: 发奖回调触发 %d 次", fired);
+    if (l <= 6) L("⑤ noAd: 发奖回调 %d 次", fired);
 }
 
-// GorillaAd.Runtime.LocalRewardedVideoAd.Show() (无参) 替换实现
 static void ad_replacement_show0(void *self) {
     if (g_hookN > 1) g_hooks[1].hits++;
     static int l = 0;
@@ -941,30 +762,26 @@ static void ad_replacement_show0(void *self) {
 }
 
 static void ad_hook_install(void) {
-    if (g_adHooked) return;
-    if (!g_parsed) return;
+    if (g_adHooked || !g_parsed) return;
     if (m_AD_CheckAndPlayVideo) {
-        void *slot = dk_hook_method(m_AD_CheckAndPlayVideo, (void *)ad_replacement_2, "ADMgr.CheckAndPlayVideo");
-        if (slot) { g_ad_mp_slot = slot; g_adHooked++; }
+        void *s = dk_hook_method(m_AD_CheckAndPlayVideo, (void *)ad_replacement_2, "CheckAndPlayVideo");
+        if (s) { g_ad_mp_slot = s; g_adHooked++; }
     }
     if (m_Ad_Show0) {
         if (dk_hook_method(m_Ad_Show0, (void *)ad_replacement_show0, "LocalAd.Show")) g_adHooked++;
     }
-    L("⑤ noAd: hooked=%d (CheckAndPlayVideo=%p LocalShow=%p)", g_adHooked, m_AD_CheckAndPlayVideo, m_Ad_Show0);
+    L("⑤ noAd: hooked=%d (play=%p show0=%p)", g_adHooked, m_AD_CheckAndPlayVideo, m_Ad_Show0);
 }
 
 static void ad_hook_remove(void) {
+    if (!g_adHooked) return;
     dk_unhook_all();
     g_adHooked = 0;
     g_ad_mp_slot = NULL;
-    L("⑤ noAd: hook 已移除");
+    L("⑤ noAd: 已移除");
 }
 
 // ───────────────────── 功能 ① 怪物自杀 / 秒杀 ─────────────────────
-// 路线1 (首选): EntityManager.EnemyCommitSuicide(entity, reason) — 引擎自带自杀入口
-// 路线2 (兜底): EntityCharacter.SetHp(0) → 覆写 setter 使 IsDead 成立 → OnDeath(tdd) 驱动表现/掉落
-static int   g_killScanned = 0, g_killDone = 0, g_killSkip = 0;
-
 static void do_kill(void) {
     void *ctx = get_ctx();
     if (!ctx) return;
@@ -976,7 +793,6 @@ static void do_kill(void) {
     if (size <= 0) return;
     if (size > 800) size = 800;
 
-    // 玩家指针集合 (GetAllPlayer → EntityHero[])
     void *players[8] = {0};
     int pc = 0;
     if (m_EM_GetAllPlayer) {
@@ -992,36 +808,25 @@ static void do_kill(void) {
     for (int i = 0; i < size; i++) {
         void *e = list_at(list, i);
         if (!e) continue;
-        // 排除玩家
         int isPlayer = 0;
         for (int p = 0; p < pc; p++) if (e == players[p]) { isPlayer = 1; break; }
         if (isPlayer) { sk++; continue; }
-        // 必须是 EntityCharacter (怪物/召唤物都在其下)
-        Il2CppClass *cls = I.object_get_class ? (Il2CppClass *)I.object_get_class(e) : NULL;
-        if (!cls || !I.class_is_assignable_from) continue;
-        if (!I.class_is_assignable_from(k_Char, cls)) continue;
-        if (k_Hero && I.class_is_assignable_from(k_Hero, cls)) { sk++; continue; }   // 英雄侧跳过
-        // 已死跳过
+        if (!is_inst_of(e, k_Char)) continue;
+        if (k_Hero && is_inst_of(e, k_Hero)) { sk++; continue; }
         if (m_Char_getIsDead) {
             Il2CppObject *dead = ic_call(m_Char_getIsDead, e, NULL);
             if (dead && *(uint8_t *)((uint8_t *)dead + 0x10)) continue;
         }
         sc++;
-        // 路线1: EnemyCommitSuicide
         BOOL ok = NO;
-        if (m_EM_GetEntityValues && k_EM) {
-            static void *m_commit = NULL;
-            if (!m_commit) m_commit = I.class_get_method_from_name(k_EM, "EnemyCommitSuicide", 2);
-            if (m_commit) {
-                // (EntityCharacter entity, int reason) — reason 用 0
-                void *args[2] = { e, NULL };
-                int32_t reason = 0;
-                args[1] = &reason;
-                ic_call(m_commit, em, args);
-                ok = YES;
-            }
+        // 路线1: EnemyCommitSuicide(entity, reason)
+        if (m_EM_EnemyCommitSuicide) {
+            int32_t reason = 0;
+            void *args[2] = { e, &reason };
+            ic_call(m_EM_EnemyCommitSuicide, em, args);
+            ok = YES;
         }
-        // 路线2: SetHp(0) + OnDeath
+        // 路线2: SetHp(0) + OnDeath(tdd)
         if (!ok) {
             if (m_Char_SetHp) {
                 int64_t zero = 0;
@@ -1032,9 +837,9 @@ static void do_kill(void) {
                 Il2CppObject *tdd = I.object_new(k_TDD);
                 if (tdd) {
                     uint8_t *t = (uint8_t *)tdd;
-                    *(uint8_t  *)(t + 0x18) = 1;            // UseDeathVibration
-                    *(int32_t  *)(t + 0x1C) = 6;            // AttackerType.GM
-                    *(uint64_t *)(t + 0x28) = 999999999ULL; // HurtValue
+                    *(uint8_t  *)(t + 0x18) = 1;
+                    *(int32_t  *)(t + 0x1C) = 6;
+                    *(uint64_t *)(t + 0x28) = 999999999ULL;
                     void *args[1] = { tdd };
                     ic_call(m_Char_OnDeath, e, args);
                 }
@@ -1042,19 +847,16 @@ static void do_kill(void) {
         }
         dl++;
     }
-    g_killScanned = sc; g_killDone = dl; g_killSkip = sk;
     static int kl = 0;
     if (++kl <= 3 || kl % 40 == 0) L("① kill: 扫描%d 清%d 跳%d (玩家%d)", sc, dl, sk, pc);
 }
 
 // ───────────────────── 功能 ② 无敌 ─────────────────────
-// AddAbsoluteInvincibility() (首选, 无参) + set_CurrentHp(999999999) + AddCharacterStatus(ImmuneDamage=2)
 static void do_invincible(void) {
     void *ctx = get_ctx();
     if (!ctx) return;
     void *em = ctx_entity(ctx);
     if (!em) return;
-    // 玩家英雄: GetAllPlayer → 逐个
     void *heroes[4] = {0};
     int hn = 0;
     if (m_EM_GetAllPlayer) {
@@ -1065,85 +867,72 @@ static void do_invincible(void) {
             hn = pn;
         }
     }
-    // 兜底: GetEntityValues 里筛 EntityHero
-    if (hn == 0 && m_EM_GetEntityValues && I.class_is_assignable_from) {
+    if (hn == 0 && m_EM_GetEntityValues && k_Hero) {
         void *list = ic_call(m_EM_GetEntityValues, em, NULL);
         if (list) {
             int32_t n = list_size(list); if (n > 800) n = 800;
             for (int i = 0; i < n && hn < 4; i++) {
                 void *e = list_at(list, i);
-                if (!e) continue;
-                Il2CppClass *cls = I.object_get_class ? (Il2CppClass *)I.object_get_class(e) : NULL;
-                if (cls && k_Hero && I.class_is_assignable_from(k_Hero, cls)) heroes[hn++] = e;
+                if (e && is_inst_of(e, k_Hero)) heroes[hn++] = e;
             }
         }
     }
     for (int i = 0; i < hn; i++) {
         void *h = heroes[i];
         if (!h) continue;
-        // ① 绝对无敌
         if (m_Char_AddAbsInv) ic_call(m_Char_AddAbsInv, h, NULL);
-        // ② 血量拉满 (覆写 setter)
         void *setHp = m_Char_setCurrentHp;
-        if (!setHp && I.object_get_class) {
-            Il2CppClass *rc = (Il2CppClass *)I.object_get_class(h);
-            if (rc) setHp = I.class_get_method_from_name(rc, "set_CurrentHp", 1);
-        }
+        if (!setHp) setHp = vmi(h, "set_CurrentHp", 1);
         if (setHp) {
             int64_t big = 999999999LL;
             void *args[1] = { &big };
             ic_call(setHp, h, args);
         }
-        // ③ 免疫伤害状态
         if (m_Char_AddStatus) {
-            int32_t st = 2;   // CharacterStatusType.ImmuneDamage (枚举序 None=0,ImmuneSelect=1,ImmuneDamage=2)
+            int32_t st = 2;   // 【推测】CharacterStatusType.ImmuneDamage (枚举序 None,ImmuneSelect,ImmuneDamage,...)
             void *args[1] = { &st };
             ic_call(m_Char_AddStatus, h, args);
         }
     }
     static int il = 0;
-    if (++il <= 3 || il % 60 == 0) L("② inv: 英雄%d abs=%p setHp=%p status=%p", hn, m_Char_AddAbsInv, m_Char_setCurrentHp, m_Char_AddStatus);
+    if (++il <= 3 || il % 60 == 0)
+        L("② inv: 英雄%d abs=%p setHp=%p status=%p", hn, m_Char_AddAbsInv, m_Char_setCurrentHp, m_Char_AddStatus);
 }
 
 // ───────────────────── 功能 ③ 一键通关 ─────────────────────
-// 路线1: BattleManager.OnMissionClear() → 本关通过判定
-// 路线2: 先清场 (do_kill) 再 OnMissionClear / OnChapterEnd
 static void do_pass_chapter(void) {
     void *ctx = get_ctx();
     if (!ctx) { if (g_statusSub) g_statusSub.text = @"未在战斗中"; return; }
-    // 先清场 (最后一波怪物必须死光才会触发通关判定)
     do_kill();
     void *bm = ctx_battlemgr(ctx);
     if (!bm) { if (g_statusSub) g_statusSub.text = @"BattleManager 未就绪"; return; }
     if (m_BM_OnMissionClear) ic_call(m_BM_OnMissionClear, bm, NULL);
     if (m_BM_OnChapterEnd)   ic_call(m_BM_OnChapterEnd, bm, NULL);
-    L("③ pass: OnMissionClear=%p OnChapterEnd=%p 已触发", m_BM_OnMissionClear, m_BM_OnChapterEnd);
+    L("③ pass: OnMissionClear=%p OnChapterEnd=%p", m_BM_OnMissionClear, m_BM_OnChapterEnd);
     if (g_statusSub) g_statusSub.text = @"一键通关已触发 (清场+过关判定)";
 }
 
 // ───────────────────── 功能 ④ 游戏加速 ─────────────────────
-// 路线1 (最稳): HotFix.GameManager.SetTimeScale(float)  — 游戏官方加速入口
-// 路线2        HotFix.Game.SetTimeScale(float)          — 静态门面
-// 路线3        WorldContext.gameSpeed 直写 (Q16.16 定点, 帧同步确定性时基)
+static void *get_gamemanager(void) {
+    static void *cache = NULL;
+    if (cache) return cache;
+    if (!k_GameMgr) return NULL;
+    void *mi = mof(k_GameMgr, "get_Instance", 0);
+    if (mi) {
+        Il2CppObject *o = ic_call(mi, NULL, NULL);
+        if (o) { cache = o; L("GameManager.Instance = %p", o); return o; }
+    }
+    return NULL;
+}
+
 static void do_speed(void) {
     float f = g_speedMult;
     int done = 0;
-    // 路线1: GameManager 实例
     if (m_GM_SetTimeScale) {
         void *gm = get_gamemanager();
-        if (gm) {
-            void *args[1] = { &f };
-            ic_call(m_GM_SetTimeScale, gm, args);
-            done++;
-        }
+        if (gm) { void *a[1] = { &f }; ic_call(m_GM_SetTimeScale, gm, a); done++; }
     }
-    // 路线2: Game.SetTimeScale (static)
-    if (m_Game_SetTimeScale) {
-        void *args[1] = { &f };
-        ic_call(m_Game_SetTimeScale, NULL, args);
-        done++;
-    }
-    // 路线3: 直写 gameSpeed
+    if (m_Game_SetTimeScale) { void *a[1] = { &f }; ic_call(m_Game_SetTimeScale, NULL, a); done++; }
     void *ctx = get_ctx();
     if (ctx && off_Ctx_gameSpeed > 0) {
         *(uint64_t *)((uint8_t *)ctx + off_Ctx_gameSpeed) = (uint64_t)(f * 65536.0f);
@@ -1154,7 +943,7 @@ static void do_speed(void) {
     static int sl = 0;
     if (++sl <= 4 || sl % 60 == 0) {
         uint64_t rb = (ctx && off_Ctx_gameSpeed > 0) ? *(uint64_t *)((uint8_t *)ctx + off_Ctx_gameSpeed) : 0;
-        L("④ speed: %.2fx done=%d (GM=%p Game=%p) gameSpeed回读=%.2f",
+        L("④ speed: %.2fx done=%d GM=%p Game=%p readback=%.2f",
           f, done, m_GM_SetTimeScale, m_Game_SetTimeScale, (double)rb / 65536.0);
     }
 }
@@ -1170,18 +959,6 @@ static void restore_speed(void) {
     L("④ speed: 恢复 1.0x");
 }
 
-// ───────────────────── 功能 ⑤ 免广告 ─────────────────────
-// 原理: 广告播放入口 ADModuleMgr.CheckAndPlayVideo(callback, source) 内部调原生 SDK 播视频,
-//       播完回调 _onClose 发奖。免广告 = 跳过播放直接调回调发奖。
-// 实现: MethodInfo->methodPointer 热替换 (数据段函数指针, 零 __TEXT patch, 零 icache 风险)
-//       实现在 part5 (ad_hook) — 此处仅提供开关入口与状态。
-static void do_no_ad(void) {
-    if (g_noAdOn) ad_hook_install(); else ad_hook_remove();
-    static int nl = 0;
-    if (++nl <= 3) L("⑤ noAd: 开关=%d CheckAndPlayVideo=%p hookSlot=%p",
-                     g_noAdOn, m_AD_CheckAndPlayVideo, g_ad_mp_slot);
-}
-
 // ───────────────────── 功能 ⑥ 局内经验 ─────────────────────
 static void do_add_exp(void) {
     void *ctx = get_ctx();
@@ -1190,14 +967,13 @@ static void do_add_exp(void) {
     int done = 0;
     if (bd && m_BD_AddUserExp) {
         int32_t v = g_expValue;
-        void *args[1] = { &v };
-        ic_call(m_BD_AddUserExp, bd, args);
+        void *a[1] = { &v };
+        ic_call(m_BD_AddUserExp, bd, a);
         done++;
     }
-    // 同时触发结算型经验 (BattleManager.AddExpAndGold)
     void *bm = ctx_battlemgr(ctx);
     if (bm && m_BM_AddExpAndGold) { ic_call(m_BM_AddExpAndGold, bm, NULL); done++; }
-    L("⑥ exp: BattleData.AddUserExp(%d)=%d BM.AddExpAndGold=%d done=%d", g_expValue,
+    L("⑥ exp: AddUserExp(%d)=%d AddExpAndGold=%d done=%d", g_expValue,
       m_BD_AddUserExp ? 1 : 0, m_BM_AddExpAndGold ? 1 : 0, done);
     if (g_statusSub) g_statusSub.text = [NSString stringWithFormat:@"已加经验 +%d", g_expValue];
 }
@@ -1209,44 +985,67 @@ static void do_add_gold(void) {
     void *bd = ctx_battledata(ctx);
     if (!bd) { if (g_statusSub) g_statusSub.text = @"BattleData 未就绪"; return; }
     int32_t v = g_goldValue;
-    void *args[1] = { &v };
-    if (m_BD_AddDropGold) ic_call(m_BD_AddDropGold, bd, args);   // 掉落金币
-    if (m_BD_AddWaveGold) ic_call(m_BD_AddWaveGold, bd, args);   // 波次金币
+    void *a[1] = { &v };
+    if (m_BD_AddDropGold) ic_call(m_BD_AddDropGold, bd, a);
+    if (m_BD_AddWaveGold) ic_call(m_BD_AddWaveGold, bd, a);
     L("⑦ gold: AddDropGold(%d)=%p AddWaveGold=%p", g_goldValue, m_BD_AddDropGold, m_BD_AddWaveGold);
     if (g_statusSub) g_statusSub.text = [NSString stringWithFormat:@"已加金币 +%d", g_goldValue];
 }
-// ───────────────────── 主循环 tick ─────────────────────
+
+// ───────────────────── 功能 ⑤ 免广告 (开关入口) ─────────────────────
+static void do_no_ad(void) {
+    if (g_noAdOn) ad_hook_install(); else ad_hook_remove();
+    L("⑤ noAd: 开关=%d play=%p hooked=%d", g_noAdOn, m_AD_CheckAndPlayVideo, g_adHooked);
+}
+
+// ───────────────────── 主循环 tick (主线程) ─────────────────────
+// ⚠️ 所有 il2cpp 调用只在这里 (主线程) 执行。每个 tick 内部按 tickCounter 降频,
+//    避免高频反射调用影响游戏主线程帧率。
+static int g_tickN = 0;
+
 static void combat_tick(void) {
     if (!ic_ready) return;
-    if (!g_parsed) return;
+    g_tickN++;
+    if (!g_parsed) { resolve_step(); return; }
+
     int g = DK_GUARD_BEGIN();
     if (g == 0) {
-        BOOL alive = battle_alive();
-        static BOOL wasIn = NO;
-        if (alive != wasIn) {
-            wasIn = alive; g_inBattle = alive;
-            L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", get_world(), get_ctx());
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (g_statusSub) g_statusSub.text = alive ? @"战斗中 ✓ 功能即时生效" : @"已就绪，进入关卡后生效";
-            });
+        // 战斗状态只在每 3 tick (1.2s) 判一次, 降低反射频率
+        if (g_tickN % 3 == 0) {
+            BOOL alive = battle_alive();
+            static BOOL wasIn = NO;
+            if (alive != wasIn) {
+                wasIn = alive; g_inBattle = alive;
+                L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", get_world(), get_ctx());
+                if (alive) {
+                    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+                    [ud setInteger:0 forKey:@"dk3_crashStreak"];
+                    [ud synchronize];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (g_statusSub) g_statusSub.text = alive ? @"战斗中 ✓ 功能即时生效" : @"已就绪，进入关卡后生效";
+                });
+            }
         }
-        if (g_noAdOn) ad_hook_install(); else ad_hook_remove();
-        if (alive) {
-            if (g_killOn)  do_kill();
-            if (g_invOn)   do_invincible();
-            if (g_speedOn) do_speed();
-            else if (g_speedWasOn) { restore_speed(); }
+        // 免广告 hook 状态同步 (只在开关变化时)
+        static BOOL adInstalled = NO;
+        if (g_noAdOn != adInstalled) { do_no_ad(); adInstalled = g_noAdOn; }
+
+        if (g_inBattle) {
+            if (g_killOn  && (g_tickN % 2 == 0)) do_kill();       // 0.8s 一次
+            if (g_invOn   && (g_tickN % 3 == 0)) do_invincible();
+            if (g_speedOn && (g_tickN % 3 == 0)) do_speed();
+            else if (g_speedWasOn && (g_tickN % 3 == 0)) restore_speed();
         }
         g_speedWasOn = g_speedOn;
         DK_GUARD_END();
         return;
     }
-    // SIGSEGV 兜底恢复
-    L("⚠️ tick 捕获异常 (SIGSEGV 守卫生效) — 本次跳过");
+    L("⚠️ tick 捕获内存异常 (已跳过本次)");
     DK_GUARD_END();
 }
 
-// ───────────────────── UI: 卡片面板 ─────────────────────
+// ───────────────────── UI ─────────────────────
 #define DK_TEAL   [UIColor colorWithRed:0.243 green:0.714 blue:0.761 alpha:1]
 #define DK_TEALBG [UIColor colorWithRed:0.874 green:0.953 blue:0.961 alpha:1]
 #define DK_RED    [UIColor colorWithRed:0.992 green:0.906 blue:0.906 alpha:1]
@@ -1266,17 +1065,16 @@ static void combat_tick(void) {
 - (void)speedSw:(UISwitch *)sw;
 - (void)noAdSw:(UISwitch *)sw;
 - (void)passTap;
-- (void)expGo;
-- (void)goldGo;
+- (void)expGo; - (void)goldGo;
 - (void)expDec; - (void)expInc;
 - (void)goldDec; - (void)goldInc;
 - (void)spdDec; - (void)spdInc;
 @end
 
-static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
+static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
     CGFloat hw = sz.width / 2, hh = sz.height / 2;
-    c.x = MAX(hw + 4, MIN(bounds.size.width - hw - 4, c.x));
-    c.y = MAX(hh + 30, MIN(bounds.size.height - hh - 20, c.y));
+    c.x = MAX(hw + 4, MIN(b.size.width - hw - 4, c.x));
+    c.y = MAX(hh + 34, MIN(b.size.height - hh - 20, c.y));
     return c;
 }
 
@@ -1285,8 +1083,7 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
 - (void)ballPan:(UIPanGestureRecognizer *)gr {
     CGPoint t = [gr translationInView:gr.view.superview];
     if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = gr.view.center;
-        c.x += t.x; c.y += t.y;
+        CGPoint c = gr.view.center; c.x += t.x; c.y += t.y;
         gr.view.center = dk_clamp(c, gr.view.bounds.size, gr.view.superview.bounds);
         [gr setTranslation:CGPointZero inView:gr.view.superview];
     }
@@ -1294,8 +1091,7 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
 - (void)panelPan:(UIPanGestureRecognizer *)gr {
     CGPoint t = [gr translationInView:g_panel.superview];
     if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = g_panel.center;
-        c.x += t.x; c.y += t.y;
+        CGPoint c = g_panel.center; c.x += t.x; c.y += t.y;
         g_panel.center = dk_clamp(c, g_panel.bounds.size, g_panel.superview.bounds);
         [gr setTranslation:CGPointZero inView:g_panel.superview];
     }
@@ -1309,18 +1105,18 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
     return YES;
 }
 - (void)closeTapped { g_panel.hidden = YES; }
-- (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"]; L("①秒杀→%d", sw.on); }
-- (void)invSw:(UISwitch *)sw   { g_invOn   = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];  L("②无敌→%d", sw.on); }
+- (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"];  L("①秒杀→%d", sw.on); }
+- (void)invSw:(UISwitch *)sw   { g_invOn   = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];   L("②无敌→%d", sw.on); }
 - (void)speedSw:(UISwitch *)sw { g_speedOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_spd"];
                                  if (!sw.on) restore_speed(); L("④加速→%d (%.1fx)", sw.on, g_speedMult); }
 - (void)noAdSw:(UISwitch *)sw  { g_noAdOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_noad"];
-                                 if (sw.on) ad_hook_install(); else ad_hook_remove(); L("⑤免广告→%d", sw.on); }
+                                 do_no_ad(); L("⑤免广告→%d", sw.on); }
 - (void)passTap { do_pass_chapter(); }
 - (void)expGo   { do_add_exp(); }
 - (void)goldGo  { do_add_gold(); }
-- (void)expDec  { if (g_expValue > 100) g_expValue -= 100;  g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
-- (void)expInc  { if (g_expValue < 100000) g_expValue += 100; g_expVal.text = [NSString stringWithFormat:@"%d", g_expValue]; }
-- (void)goldDec { if (g_goldValue > 100) g_goldValue -= 100; g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
+- (void)expDec  { if (g_expValue > 100) g_expValue -= 100;    g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
+- (void)expInc  { if (g_expValue < 100000) g_expValue += 100; g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
+- (void)goldDec { if (g_goldValue > 100) g_goldValue -= 100;  g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
 - (void)goldInc { if (g_goldValue < 100000) g_goldValue += 100; g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
 - (void)spdDec  { if (g_speedMult > 0.5f) g_speedMult -= 0.5f; g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult]; }
 - (void)spdInc  { if (g_speedMult < 8.0f) g_speedMult += 0.5f; g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult]; }
@@ -1367,7 +1163,6 @@ static UIView *mkToggleCard(CGRect f, NSString *emoji, UIColor *bg, NSString *ti
     mkSw(CGRectMake(f.size.width - 50, (f.size.height - 31) / 2, 51, 31), on, tgt, sel, c);
     return c;
 }
-// 步进卡: − 值 ＋
 static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, NSString *sub,
                           UILabel * __strong *outVal, id tgt, SEL dec, SEL inc, UIView *p) {
     UIView *c = mkCard(f, p);
@@ -1397,7 +1192,6 @@ static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *titl
     [c addSubview:u];
     return c;
 }
-// 大动作按钮卡
 static UIView *mkGoCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, id tgt, SEL sel, UIView *p) {
     UIView *c = mkCard(f, p);
     c.layer.cornerRadius = 18;
@@ -1434,21 +1228,22 @@ static UIWindow *dk_game_window(void) {
 static void dk_build_ui(void) {
     UIWindow *win = dk_game_window();
     if (!win) { L("UI: 游戏 window 未就绪"); return; }
-    CGFloat W = MIN(300, win.bounds.size.width - 24);
-    CGFloat x = (win.bounds.size.width - W) / 2;
-    CGFloat y = 74;
-    g_panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, W, 470)];
-    g_panel.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.973 alpha:1];
-    g_panel.layer.cornerRadius = 20;
-    g_panel.layer.shadowColor = UIColor.blackColor.CGColor;
-    g_panel.layer.shadowOpacity = 0.25; g_panel.layer.shadowOffset = CGSizeMake(0, 6); g_panel.layer.shadowRadius = 14;
-    g_panel.hidden = YES;
-    [win addSubview:g_panel];
-
+    CGFloat W = MIN(302, win.bounds.size.width - 24);
+    CGFloat x0 = (win.bounds.size.width - W) / 2;
+    CGFloat y = 76;
     CGFloat pad = 12, cw = (W - pad * 3) / 2, ch = 56;
-    // 标题栏
-    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), g_panel);
-    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), g_panel);
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x0, 76, W, 500)];
+    panel.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.973 alpha:1];
+    panel.layer.cornerRadius = 20;
+    panel.layer.shadowColor = UIColor.blackColor.CGColor;
+    panel.layer.shadowOpacity = 0.25; panel.layer.shadowOffset = CGSizeMake(0, 6); panel.layer.shadowRadius = 14;
+    panel.hidden = YES;
+    [win addSubview:panel];
+    g_panel = panel;
+
+    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), panel);
+    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), panel);
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(W - 40, 14, 26, 26);
     closeBtn.backgroundColor = DK_RED; closeBtn.layer.cornerRadius = 13;
@@ -1456,66 +1251,62 @@ static void dk_build_ui(void) {
     [closeBtn setTitleColor:[UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1] forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [closeBtn addTarget:g_helper action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    [g_panel addSubview:closeBtn];
+    [panel addSubview:closeBtn];
 
     y = 52;
-    mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死",  g_killOn,  g_helper, @selector(killSw:),  g_panel);
-    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🛡️", DK_BLUE, @"无敌",     @"绝对无敌+满血", g_invOn,   g_helper, @selector(invSw:),   g_panel);
+    mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死", g_killOn, g_helper, @selector(killSw:), panel);
+    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🛡️", DK_BLUE, @"无敌", @"绝对无敌+满血", g_invOn, g_helper, @selector(invSw:), panel);
     y += ch + 8;
-    mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速",  g_speedOn, g_helper, @selector(speedSw:), g_panel);
-    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD,  @"免广告",   @"跳过视频直发奖", g_noAdOn,  g_helper, @selector(noAdSw:),  g_panel);
+    mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速", g_speedOn, g_helper, @selector(speedSw:), panel);
+    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD, @"免广告", @"跳过视频直发奖", g_noAdOn, g_helper, @selector(noAdSw:), panel);
     y += ch + 8;
-    // 一键通关 (大按钮)
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), g_panel);
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), panel);
     y += 64;
-    // 加速倍率步进
-    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整 (开启加速后生效)",
-               &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), g_panel);
+    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整",
+               &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 64;
-    // 经验
     mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GREEN, @"单次经验", @"点 ± 改量",
-               &g_expVal, g_helper, @selector(expDec), @selector(expInc), g_panel);
+               &g_expVal, g_helper, @selector(expDec), @selector(expInc), panel);
     g_expVal.text = [NSString stringWithFormat:@"%d", g_expValue];
     y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GREEN, @"增加局内经验", g_helper, @selector(expGo), g_panel);
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GREEN, @"增加局内经验", g_helper, @selector(expGo), panel);
     y += 56;
-    // 金币
     mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🪙", DK_GOLD, @"单次金币", @"点 ± 改量",
-               &g_goldVal, g_helper, @selector(goldDec), @selector(goldInc), g_panel);
+               &g_goldVal, g_helper, @selector(goldDec), @selector(goldInc), panel);
     g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue];
     y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), g_panel);
-    y += 56;
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), panel);
+    y += 52;
     mkLabel(@"弹壳战机 1.1.7 · 单机PvE · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithRed:0.69 green:0.69 blue:0.73 alpha:1],
-            CGRectMake(pad, y, W - pad*2, 14), g_panel).textAlignment = NSTextAlignmentCenter;
-    g_panel.frame = CGRectMake(x, MIN(74, MAX(20, win.bounds.size.height - (y + 30))), W, y + 30);
+            CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
-    // 拖动面板
+    CGFloat ph = y + 26;
+    panel.frame = CGRectMake(x0, 76, W, ph);
     g_panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(panelPan:)];
     g_panelPan.delegate = g_helper;
-    [g_panel addGestureRecognizer:g_panelPan];
+    [panel addGestureRecognizer:g_panelPan];
 
-    // 悬浮球 (58pt, 直接挂游戏 window 顶层 → 球外区域天然不挡触摸)
-    g_ball = [UIButton buttonWithType:UIButtonTypeCustom];
     CGFloat bs = 58;
-    g_ball.frame = CGRectMake(win.bounds.size.width - bs - 16, 150, bs, bs);
-    g_ball.layer.cornerRadius = bs / 2;
-    g_ball.backgroundColor = DK_TEAL;
-    g_ball.layer.borderWidth = 2;
-    g_ball.layer.borderColor = UIColor.whiteColor.CGColor;
-    g_ball.layer.shadowColor = UIColor.blackColor.CGColor;
-    g_ball.layer.shadowOpacity = 0.3; g_ball.layer.shadowOffset = CGSizeMake(0, 3); g_ball.layer.shadowRadius = 6;
-    [g_ball setTitle:@"弹" forState:UIControlStateNormal];
-    [g_ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    g_ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-    [g_ball addTarget:g_helper action:@selector(ballTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *ball = [UIButton buttonWithType:UIButtonTypeCustom];
+    ball.frame = CGRectMake(win.bounds.size.width - bs - 16, 150, bs, bs);
+    ball.layer.cornerRadius = bs / 2;
+    ball.backgroundColor = DK_TEAL;
+    ball.layer.borderWidth = 2;
+    ball.layer.borderColor = UIColor.whiteColor.CGColor;
+    ball.layer.shadowColor = UIColor.blackColor.CGColor;
+    ball.layer.shadowOpacity = 0.3; ball.layer.shadowOffset = CGSizeMake(0, 3); ball.layer.shadowRadius = 6;
+    [ball setTitle:@"弹" forState:UIControlStateNormal];
+    [ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [ball addTarget:g_helper action:@selector(ballTapped) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *bp = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(ballPan:)];
     bp.delegate = g_helper;
-    [g_ball addGestureRecognizer:bp];
-    [win addSubview:g_ball];
-    L("UI ✓ 面板+悬浮球已挂载 (win=%.0fx%.0f)", win.bounds.size.width, win.bounds.size.height);
+    [ball addGestureRecognizer:bp];
+    [win addSubview:ball];
+    g_ball = ball;
+    L("UI ✓ 面板%.0fx%.0f + 球58 已挂载 (win %.0fx%.0f)", W, ph, win.bounds.size.width, win.bounds.size.height);
 }
 
 static void dk_ensure_overlay(void) {
@@ -1524,72 +1315,86 @@ static void dk_ensure_overlay(void) {
     if (!g_ball) { dk_build_ui(); return; }
     if (g_ball.superview != win) [win addSubview:g_ball];
     if (g_panel.superview != win) [win addSubview:g_panel];
-    if (win.subviews.lastObject != g_panel && !g_panel.hidden) [win bringSubviewToFront:g_panel];
-    if (win.subviews.lastObject != g_ball && g_panel.hidden) [win bringSubviewToFront:g_ball];
-    if (win.subviews.lastObject != g_ball && !g_panel.hidden) [win bringSubviewToFront:g_ball];
+    if (!g_panel.hidden) [win bringSubviewToFront:g_panel];
+    [win bringSubviewToFront:g_ball];
 }
 
 // ───────────────────── 安装 / 入口 ─────────────────────
+// ⚠️ v3.0 真机教训: ctor 里不要做任何 il2cpp 调用 (SDK 未初始化)。
+//    且 ctor 只允许执行一次 —— 日志里 ctor 出现 3 次 = 崩溃-重启循环的标志。
+//    v3.1 加入崩溃熔断: 连续 3 次启动未进入战斗 → 自我禁用 (写 off 文件)。
+static int dk_crash_streak(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    return (int)[ud integerForKey:@"dk3_crashStreak"];
+}
+static void dk_crash_streak_set(int v) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setInteger:v forKey:@"dk3_crashStreak"];
+    [ud synchronize];
+}
+
+static __block BOOL g_installed = NO;   // 防重入 (同一进程多次触发)
+
 static void dk_install_all(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *doc = paths.firstObject;
+    if (g_installed) return;
+    g_installed = YES;
+
+    NSString *doc = dk_doc_path();
     if (doc && [NSFileManager.defaultManager fileExistsAtPath:
                 [doc stringByAppendingPathComponent:@"dkzj3_off"]]) {
-        L("dkzj3_off 存在 → 禁用"); return;
+        L("dkzj3_off 存在 → 禁用 (删除该文件后重启游戏即可恢复)"); return;
     }
+    // 崩溃熔断检查
+    int streak = dk_crash_streak();
+    if (streak >= 3) {
+        L("⚠️ 连续 %d 次启动未进战斗 → 熔断自我禁用", streak);
+        if (doc) {
+            NSString *off = [doc stringByAppendingPathComponent:@"dkzj3_off"];
+            [@"auto-disabled after 3 crash-restarts" writeToFile:off atomically:YES
+                                                      encoding:NSUTF8StringEncoding error:nil];
+        }
+        return;
+    }
+    dk_crash_streak_set(streak + 1);
+    L("== DKZJ v3.1 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+      streak + 1, (void *)g_unityBase, g_slide);
+
     dk_guard_install();
-    if (!find_unity_base()) { L("X UnityFramework 未找到"); return; }
-    L("== DKZJ v3.0 启动 — unity base=%p text=0x%llx slide=%d",
-      (void *)g_unityBase, g_textSize, g_slide);
-    dk_syms_load();
     if (!ic_init()) { L("X il2cpp 初始化失败 → 禁用"); return; }
 
-    // 阶段A: 后台线程解析 (HybridCLR 热更类需 il2cpp_thread_attach)
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        ic_ensure_thread();
-        for (int i = 0; i < 240; i++) {          // 最多 4 分钟 (热更可能较晚加载)
-            if (resolve_try()) break;
-            usleep(1000 * 1000);
-        }
-        if (!g_parsed) L("A X 解析超时 (热更未加载?)");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (g_statusSub)
-                g_statusSub.text = g_parsed ? @"已就绪，进入关卡后生效" : @"解析超时 (请重进游戏)";
-        });
-    });
-
-    // UI + 主循环
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+    // 全部反射解析在主线程分步进行 (resolve_step 由 tick 驱动)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         dk_build_ui();
+        if (g_statusSub) g_statusSub.text = @"解析中… (主线程分步)";
         [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(__unused NSTimer *t){
             combat_tick();
             static int k = 0;
-            if (++k % 10 == 0) dk_ensure_overlay();
+            if (++k % 12 == 0) dk_ensure_overlay();
         }];
+        L("install done — 点球开面板 (7 功能)");
     });
-    L("install done — 点球开面板 (7 功能)");
 }
 
 __attribute__((constructor))
 static void dkzj_ctor(void) {
     NSString *bid = NSBundle.mainBundle.bundleIdentifier;
-    // 只对目标包注入 (主包 / 分发包名均兼容)
-    if (![bid hasPrefix:@"com.survivor.ace"]) {
-        L("ctor: bundle=%@ ≠ com.survivor.ace* → skip", bid);
+    if (!bid) { L("ctor: bundleIdentifier 为 nil → 等待"); }
+    else if (![bid hasPrefix:@"com.survivor.ace"]) {
+        L("ctor: bundle=%s ≠ com.survivor.ace* → skip", bid.UTF8String);
         return;
     }
-    L("ctor: bundle=%@ → 等待 UnityFramework", bid);
+    L("ctor: bundle=%s → 等 UnityFramework", bid ? bid.UTF8String : "(nil)");
     __block int tries = 0;
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                      dispatch_get_global_queue(0, 0));
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 500 * NSEC_PER_MSEC, 0);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 400 * NSEC_PER_MSEC, 0);
     dispatch_source_set_event_handler(timer, ^{
         tries++;
         if (find_unity_base()) {
             dispatch_source_cancel(timer);
-            dk_install_all();
-        } else if (tries > 120) {
+            dispatch_async(dispatch_get_main_queue(), ^{ dk_install_all(); });
+        } else if (tries > 150) {
             dispatch_source_cancel(timer);
             L("ctor: UnityFramework 超时未加载");
         }

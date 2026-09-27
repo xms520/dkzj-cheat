@@ -1,35 +1,52 @@
-// ───────────────────── 主循环 tick ─────────────────────
+
+// ───────────────────── 主循环 tick (主线程) ─────────────────────
+// ⚠️ 所有 il2cpp 调用只在这里 (主线程) 执行。每个 tick 内部按 tickCounter 降频,
+//    避免高频反射调用影响游戏主线程帧率。
+static int g_tickN = 0;
+
 static void combat_tick(void) {
     if (!ic_ready) return;
-    if (!g_parsed) return;
+    g_tickN++;
+    if (!g_parsed) { resolve_step(); return; }
+
     int g = DK_GUARD_BEGIN();
     if (g == 0) {
-        BOOL alive = battle_alive();
-        static BOOL wasIn = NO;
-        if (alive != wasIn) {
-            wasIn = alive; g_inBattle = alive;
-            L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", get_world(), get_ctx());
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (g_statusSub) g_statusSub.text = alive ? @"战斗中 ✓ 功能即时生效" : @"已就绪，进入关卡后生效";
-            });
+        // 战斗状态只在每 3 tick (1.2s) 判一次, 降低反射频率
+        if (g_tickN % 3 == 0) {
+            BOOL alive = battle_alive();
+            static BOOL wasIn = NO;
+            if (alive != wasIn) {
+                wasIn = alive; g_inBattle = alive;
+                L(">> %s战斗 (world=%p ctx=%p)", alive ? "进入" : "离开", get_world(), get_ctx());
+                if (alive) {
+                    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+                    [ud setInteger:0 forKey:@"dk3_crashStreak"];
+                    [ud synchronize];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (g_statusSub) g_statusSub.text = alive ? @"战斗中 ✓ 功能即时生效" : @"已就绪，进入关卡后生效";
+                });
+            }
         }
-        if (g_noAdOn) ad_hook_install(); else ad_hook_remove();
-        if (alive) {
-            if (g_killOn)  do_kill();
-            if (g_invOn)   do_invincible();
-            if (g_speedOn) do_speed();
-            else if (g_speedWasOn) { restore_speed(); }
+        // 免广告 hook 状态同步 (只在开关变化时)
+        static BOOL adInstalled = NO;
+        if (g_noAdOn != adInstalled) { do_no_ad(); adInstalled = g_noAdOn; }
+
+        if (g_inBattle) {
+            if (g_killOn  && (g_tickN % 2 == 0)) do_kill();       // 0.8s 一次
+            if (g_invOn   && (g_tickN % 3 == 0)) do_invincible();
+            if (g_speedOn && (g_tickN % 3 == 0)) do_speed();
+            else if (g_speedWasOn && (g_tickN % 3 == 0)) restore_speed();
         }
         g_speedWasOn = g_speedOn;
         DK_GUARD_END();
         return;
     }
-    // SIGSEGV 兜底恢复
-    L("⚠️ tick 捕获异常 (SIGSEGV 守卫生效) — 本次跳过");
+    L("⚠️ tick 捕获内存异常 (已跳过本次)");
     DK_GUARD_END();
 }
 
-// ───────────────────── UI: 卡片面板 ─────────────────────
+// ───────────────────── UI ─────────────────────
 #define DK_TEAL   [UIColor colorWithRed:0.243 green:0.714 blue:0.761 alpha:1]
 #define DK_TEALBG [UIColor colorWithRed:0.874 green:0.953 blue:0.961 alpha:1]
 #define DK_RED    [UIColor colorWithRed:0.992 green:0.906 blue:0.906 alpha:1]
@@ -49,17 +66,16 @@ static void combat_tick(void) {
 - (void)speedSw:(UISwitch *)sw;
 - (void)noAdSw:(UISwitch *)sw;
 - (void)passTap;
-- (void)expGo;
-- (void)goldGo;
+- (void)expGo; - (void)goldGo;
 - (void)expDec; - (void)expInc;
 - (void)goldDec; - (void)goldInc;
 - (void)spdDec; - (void)spdInc;
 @end
 
-static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
+static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
     CGFloat hw = sz.width / 2, hh = sz.height / 2;
-    c.x = MAX(hw + 4, MIN(bounds.size.width - hw - 4, c.x));
-    c.y = MAX(hh + 30, MIN(bounds.size.height - hh - 20, c.y));
+    c.x = MAX(hw + 4, MIN(b.size.width - hw - 4, c.x));
+    c.y = MAX(hh + 34, MIN(b.size.height - hh - 20, c.y));
     return c;
 }
 
@@ -68,8 +84,7 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
 - (void)ballPan:(UIPanGestureRecognizer *)gr {
     CGPoint t = [gr translationInView:gr.view.superview];
     if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = gr.view.center;
-        c.x += t.x; c.y += t.y;
+        CGPoint c = gr.view.center; c.x += t.x; c.y += t.y;
         gr.view.center = dk_clamp(c, gr.view.bounds.size, gr.view.superview.bounds);
         [gr setTranslation:CGPointZero inView:gr.view.superview];
     }
@@ -77,8 +92,7 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
 - (void)panelPan:(UIPanGestureRecognizer *)gr {
     CGPoint t = [gr translationInView:g_panel.superview];
     if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = g_panel.center;
-        c.x += t.x; c.y += t.y;
+        CGPoint c = g_panel.center; c.x += t.x; c.y += t.y;
         g_panel.center = dk_clamp(c, g_panel.bounds.size, g_panel.superview.bounds);
         [gr setTranslation:CGPointZero inView:g_panel.superview];
     }
@@ -92,18 +106,18 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect bounds) {
     return YES;
 }
 - (void)closeTapped { g_panel.hidden = YES; }
-- (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"]; L("①秒杀→%d", sw.on); }
-- (void)invSw:(UISwitch *)sw   { g_invOn   = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];  L("②无敌→%d", sw.on); }
+- (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"];  L("①秒杀→%d", sw.on); }
+- (void)invSw:(UISwitch *)sw   { g_invOn   = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];   L("②无敌→%d", sw.on); }
 - (void)speedSw:(UISwitch *)sw { g_speedOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_spd"];
                                  if (!sw.on) restore_speed(); L("④加速→%d (%.1fx)", sw.on, g_speedMult); }
 - (void)noAdSw:(UISwitch *)sw  { g_noAdOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_noad"];
-                                 if (sw.on) ad_hook_install(); else ad_hook_remove(); L("⑤免广告→%d", sw.on); }
+                                 do_no_ad(); L("⑤免广告→%d", sw.on); }
 - (void)passTap { do_pass_chapter(); }
 - (void)expGo   { do_add_exp(); }
 - (void)goldGo  { do_add_gold(); }
-- (void)expDec  { if (g_expValue > 100) g_expValue -= 100;  g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
-- (void)expInc  { if (g_expValue < 100000) g_expValue += 100; g_expVal.text = [NSString stringWithFormat:@"%d", g_expValue]; }
-- (void)goldDec { if (g_goldValue > 100) g_goldValue -= 100; g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
+- (void)expDec  { if (g_expValue > 100) g_expValue -= 100;    g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
+- (void)expInc  { if (g_expValue < 100000) g_expValue += 100; g_expVal.text  = [NSString stringWithFormat:@"%d", g_expValue]; }
+- (void)goldDec { if (g_goldValue > 100) g_goldValue -= 100;  g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
 - (void)goldInc { if (g_goldValue < 100000) g_goldValue += 100; g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue]; }
 - (void)spdDec  { if (g_speedMult > 0.5f) g_speedMult -= 0.5f; g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult]; }
 - (void)spdInc  { if (g_speedMult < 8.0f) g_speedMult += 0.5f; g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult]; }
@@ -150,7 +164,6 @@ static UIView *mkToggleCard(CGRect f, NSString *emoji, UIColor *bg, NSString *ti
     mkSw(CGRectMake(f.size.width - 50, (f.size.height - 31) / 2, 51, 31), on, tgt, sel, c);
     return c;
 }
-// 步进卡: − 值 ＋
 static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, NSString *sub,
                           UILabel * __strong *outVal, id tgt, SEL dec, SEL inc, UIView *p) {
     UIView *c = mkCard(f, p);
@@ -180,7 +193,6 @@ static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *titl
     [c addSubview:u];
     return c;
 }
-// 大动作按钮卡
 static UIView *mkGoCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, id tgt, SEL sel, UIView *p) {
     UIView *c = mkCard(f, p);
     c.layer.cornerRadius = 18;
@@ -217,21 +229,22 @@ static UIWindow *dk_game_window(void) {
 static void dk_build_ui(void) {
     UIWindow *win = dk_game_window();
     if (!win) { L("UI: 游戏 window 未就绪"); return; }
-    CGFloat W = MIN(300, win.bounds.size.width - 24);
-    CGFloat x = (win.bounds.size.width - W) / 2;
-    CGFloat y = 74;
-    g_panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, W, 470)];
-    g_panel.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.973 alpha:1];
-    g_panel.layer.cornerRadius = 20;
-    g_panel.layer.shadowColor = UIColor.blackColor.CGColor;
-    g_panel.layer.shadowOpacity = 0.25; g_panel.layer.shadowOffset = CGSizeMake(0, 6); g_panel.layer.shadowRadius = 14;
-    g_panel.hidden = YES;
-    [win addSubview:g_panel];
-
+    CGFloat W = MIN(302, win.bounds.size.width - 24);
+    CGFloat x0 = (win.bounds.size.width - W) / 2;
+    CGFloat y = 76;
     CGFloat pad = 12, cw = (W - pad * 3) / 2, ch = 56;
-    // 标题栏
-    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), g_panel);
-    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), g_panel);
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x0, 76, W, 500)];
+    panel.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.973 alpha:1];
+    panel.layer.cornerRadius = 20;
+    panel.layer.shadowColor = UIColor.blackColor.CGColor;
+    panel.layer.shadowOpacity = 0.25; panel.layer.shadowOffset = CGSizeMake(0, 6); panel.layer.shadowRadius = 14;
+    panel.hidden = YES;
+    [win addSubview:panel];
+    g_panel = panel;
+
+    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), panel);
+    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), panel);
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(W - 40, 14, 26, 26);
     closeBtn.backgroundColor = DK_RED; closeBtn.layer.cornerRadius = 13;
@@ -239,66 +252,62 @@ static void dk_build_ui(void) {
     [closeBtn setTitleColor:[UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1] forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [closeBtn addTarget:g_helper action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    [g_panel addSubview:closeBtn];
+    [panel addSubview:closeBtn];
 
     y = 52;
-    mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死",  g_killOn,  g_helper, @selector(killSw:),  g_panel);
-    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🛡️", DK_BLUE, @"无敌",     @"绝对无敌+满血", g_invOn,   g_helper, @selector(invSw:),   g_panel);
+    mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死", g_killOn, g_helper, @selector(killSw:), panel);
+    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🛡️", DK_BLUE, @"无敌", @"绝对无敌+满血", g_invOn, g_helper, @selector(invSw:), panel);
     y += ch + 8;
-    mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速",  g_speedOn, g_helper, @selector(speedSw:), g_panel);
-    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD,  @"免广告",   @"跳过视频直发奖", g_noAdOn,  g_helper, @selector(noAdSw:),  g_panel);
+    mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速", g_speedOn, g_helper, @selector(speedSw:), panel);
+    mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD, @"免广告", @"跳过视频直发奖", g_noAdOn, g_helper, @selector(noAdSw:), panel);
     y += ch + 8;
-    // 一键通关 (大按钮)
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), g_panel);
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), panel);
     y += 64;
-    // 加速倍率步进
-    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整 (开启加速后生效)",
-               &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), g_panel);
+    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整",
+               &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 64;
-    // 经验
     mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GREEN, @"单次经验", @"点 ± 改量",
-               &g_expVal, g_helper, @selector(expDec), @selector(expInc), g_panel);
+               &g_expVal, g_helper, @selector(expDec), @selector(expInc), panel);
     g_expVal.text = [NSString stringWithFormat:@"%d", g_expValue];
     y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GREEN, @"增加局内经验", g_helper, @selector(expGo), g_panel);
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GREEN, @"增加局内经验", g_helper, @selector(expGo), panel);
     y += 56;
-    // 金币
     mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🪙", DK_GOLD, @"单次金币", @"点 ± 改量",
-               &g_goldVal, g_helper, @selector(goldDec), @selector(goldInc), g_panel);
+               &g_goldVal, g_helper, @selector(goldDec), @selector(goldInc), panel);
     g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue];
     y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), g_panel);
-    y += 56;
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), panel);
+    y += 52;
     mkLabel(@"弹壳战机 1.1.7 · 单机PvE · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithRed:0.69 green:0.69 blue:0.73 alpha:1],
-            CGRectMake(pad, y, W - pad*2, 14), g_panel).textAlignment = NSTextAlignmentCenter;
-    g_panel.frame = CGRectMake(x, MIN(74, MAX(20, win.bounds.size.height - (y + 30))), W, y + 30);
+            CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
-    // 拖动面板
+    CGFloat ph = y + 26;
+    panel.frame = CGRectMake(x0, 76, W, ph);
     g_panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(panelPan:)];
     g_panelPan.delegate = g_helper;
-    [g_panel addGestureRecognizer:g_panelPan];
+    [panel addGestureRecognizer:g_panelPan];
 
-    // 悬浮球 (58pt, 直接挂游戏 window 顶层 → 球外区域天然不挡触摸)
-    g_ball = [UIButton buttonWithType:UIButtonTypeCustom];
     CGFloat bs = 58;
-    g_ball.frame = CGRectMake(win.bounds.size.width - bs - 16, 150, bs, bs);
-    g_ball.layer.cornerRadius = bs / 2;
-    g_ball.backgroundColor = DK_TEAL;
-    g_ball.layer.borderWidth = 2;
-    g_ball.layer.borderColor = UIColor.whiteColor.CGColor;
-    g_ball.layer.shadowColor = UIColor.blackColor.CGColor;
-    g_ball.layer.shadowOpacity = 0.3; g_ball.layer.shadowOffset = CGSizeMake(0, 3); g_ball.layer.shadowRadius = 6;
-    [g_ball setTitle:@"弹" forState:UIControlStateNormal];
-    [g_ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    g_ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-    [g_ball addTarget:g_helper action:@selector(ballTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *ball = [UIButton buttonWithType:UIButtonTypeCustom];
+    ball.frame = CGRectMake(win.bounds.size.width - bs - 16, 150, bs, bs);
+    ball.layer.cornerRadius = bs / 2;
+    ball.backgroundColor = DK_TEAL;
+    ball.layer.borderWidth = 2;
+    ball.layer.borderColor = UIColor.whiteColor.CGColor;
+    ball.layer.shadowColor = UIColor.blackColor.CGColor;
+    ball.layer.shadowOpacity = 0.3; ball.layer.shadowOffset = CGSizeMake(0, 3); ball.layer.shadowRadius = 6;
+    [ball setTitle:@"弹" forState:UIControlStateNormal];
+    [ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [ball addTarget:g_helper action:@selector(ballTapped) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *bp = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(ballPan:)];
     bp.delegate = g_helper;
-    [g_ball addGestureRecognizer:bp];
-    [win addSubview:g_ball];
-    L("UI ✓ 面板+悬浮球已挂载 (win=%.0fx%.0f)", win.bounds.size.width, win.bounds.size.height);
+    [ball addGestureRecognizer:bp];
+    [win addSubview:ball];
+    g_ball = ball;
+    L("UI ✓ 面板%.0fx%.0f + 球58 已挂载 (win %.0fx%.0f)", W, ph, win.bounds.size.width, win.bounds.size.height);
 }
 
 static void dk_ensure_overlay(void) {
@@ -307,7 +316,6 @@ static void dk_ensure_overlay(void) {
     if (!g_ball) { dk_build_ui(); return; }
     if (g_ball.superview != win) [win addSubview:g_ball];
     if (g_panel.superview != win) [win addSubview:g_panel];
-    if (win.subviews.lastObject != g_panel && !g_panel.hidden) [win bringSubviewToFront:g_panel];
-    if (win.subviews.lastObject != g_ball && g_panel.hidden) [win bringSubviewToFront:g_ball];
-    if (win.subviews.lastObject != g_ball && !g_panel.hidden) [win bringSubviewToFront:g_ball];
+    if (!g_panel.hidden) [win bringSubviewToFront:g_panel];
+    [win bringSubviewToFront:g_ball];
 }
