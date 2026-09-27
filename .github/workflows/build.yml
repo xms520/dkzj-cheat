@@ -1,0 +1,46 @@
+name: build-dkzj-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'DKZJ.m'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DKZJ.dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -dynamiclib \
+            -fobjc-arc \
+            -O1 \
+            -Wall \
+            -Wno-deprecated-declarations \
+            -o DKZJ.dylib \
+            DKZJ.m
+          file DKZJ.dylib
+          ls -la DKZJ.dylib
+
+      - name: Verify
+        run: |
+          vtool -show-build DKZJ.dylib || true
+          md5 DKZJ.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DKZJ.dylib
+          path: DKZJ.dylib
