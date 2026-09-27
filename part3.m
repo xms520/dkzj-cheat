@@ -70,8 +70,10 @@ static Il2CppClass *cn(Il2CppImage img, const char *ns, const char *name) {
 }
 
 // ── 分步状态机 ──
-enum { RS_WAIT_DOMAIN = 0, RS_HF, RS_HFB, RS_AD, RS_COR, RS_C1, RS_C2, RS_C3,
-       RS_M1, RS_M2, RS_M3, RS_M4, RS_OFF, RS_DONE, RS_FAIL };
+enum { RS_WAIT_DOMAIN=0, RS_HF, RS_HFB, RS_AD, RS_COR,
+       RS_C1, RS_C1b, RS_C2, RS_C2b, RS_C3, RS_C3b, RS_C3c,
+       RS_M1, RS_M1b, RS_M2, RS_M2b, RS_M2c, RS_M3, RS_M3b, RS_M4, RS_M4b,
+       RS_OFF, RS_DONE, RS_FAIL };
 static int g_rs = RS_WAIT_DOMAIN;
 static int g_rsTick = 0;
 static int g_rsFails = 0;
@@ -80,149 +82,163 @@ static void rs_log(const char *stage, BOOL ok) {
     L("A[%s] %s", stage, ok ? "✓" : "✗");
 }
 
-// 每个 tick 推进一小步 (每步最多 1~4 次安全调用)
+// 每 tick 推进多步 (分步执行, 每次只做少量反射调用; 单步崩溃只影响该步)
 static void resolve_step(void) {
     if (g_parsed || g_rs == RS_DONE || g_rs == RS_FAIL) return;
-    if (++g_rsTick < 3) return;      // 每 3 个 tick (≈1.2s) 走一步
+    if (++g_rsTick < 2) return;      // 每 2 个 tick (0.8s) 走一步
     g_rsTick = 0;
 
-    switch (g_rs) {
-    case RS_WAIT_DOMAIN:
-        if (ic_domain_ready()) { g_rs = RS_HF; L("A[domain] ✓ il2cpp 域就绪"); }
-        else if (++g_rsFails > 400) { g_rs = RS_FAIL; L("A[domain] ✗ 超时"); }
-        return;
-    case RS_HF:
-        g_imgHF = ic_find_image("HotFix.dll");
-        rs_log("HotFix.dll", g_imgHF != NULL);
-        if (g_imgHF) { g_rs = RS_HFB; g_rsFails = 0; }
-        else if (++g_rsFails > 200) { g_rs = RS_FAIL; }
-        return;
-    case RS_HFB:
-        g_imgHFB = ic_find_image("HotFixBattle.dll");
-        rs_log("HotFixBattle.dll", g_imgHFB != NULL);
-        if (g_imgHFB) { g_rs = RS_AD; g_rsFails = 0; }
-        else if (++g_rsFails > 200) { g_rs = RS_FAIL; }
-        return;
-    case RS_AD:
-        g_imgAD = ic_find_image("GorillaAd.Runtime.dll");
-        L("A[GorillaAd] %s", g_imgAD ? "✓" : "✗ (可缺)");
-        g_rs = RS_COR; return;
-    case RS_COR:
-        g_imgCOR = ic_find_image("mscorlib.dll");
-        L("A[mscorlib] %s", g_imgCOR ? "✓" : "✗ (可缺)");
-        g_rs = RS_C1; return;
-    case RS_C1:
-        k_BattleGame  = cn(g_imgHF, "HotFix", "BattleGame");
-        k_WorldBattle = cn(g_imgHF, "HotFix", "WorldBattle");
-        k_BLW         = cn(g_imgHFB, "HotFix.BattleLogic", "BattleLogicWorld");
-        k_Ctx         = cn(g_imgHFB, "HotFix.BattleLogic", "BattleWorldContext");
-        L("A[C1] BG=%p WB=%p BLW=%p CTX=%p", k_BattleGame, k_WorldBattle, k_BLW, k_Ctx);
-        if (k_BattleGame && k_WorldBattle && k_Ctx) g_rs = RS_C2;
-        else if (++g_rsFails > 60) { g_rs = RS_FAIL; L("A[C1] ✗ 类缺失"); }
-        return;
-    case RS_C2:
-        k_EM   = cn(g_imgHFB, "HotFix.BattleLogic", "EntityManager");
-        k_Char = cn(g_imgHFB, "HotFix.BattleLogic", "EntityCharacter");
-        k_Hero = cn(g_imgHFB, "HotFix.BattleLogic", "EntityHero");
-        k_TDD  = cn(g_imgHFB, "HotFix.BattleLogic", "TakeDamageData");
-        L("A[C2] EM=%p Char=%p Hero=%p TDD=%p", k_EM, k_Char, k_Hero, k_TDD);
-        if (k_Char) g_rs = RS_C3; else if (++g_rsFails > 60) g_rs = RS_FAIL;
-        return;
-    case RS_C3:
-        k_BattleMgr  = cn(g_imgHFB, "HotFix.BattleLogic", "BattleManager");
-        k_BattleData = cn(g_imgHFB, "HotFix.BattleLogic", "BattleData");
-        k_ADMgr      = cn(g_imgHF, "HotFix", "ADModuleMgr");
-        k_AdData     = cn(g_imgHF, "HotFix", "AdData");
-        k_Game       = cn(g_imgHF, "HotFix", "Game");
-        k_GameMgr    = cn(g_imgHF, "HotFix", "GameManager");
-        k_I64        = cn(g_imgCOR, "System", "Int64");
-        L("A[C3] BM=%p BD=%p ADMgr=%p Game=%p GM=%p I64=%p",
-          k_BattleMgr, k_BattleData, k_ADMgr, k_Game, k_GameMgr, k_I64);
-        g_rs = RS_M1; return;
-    case RS_M1:
-        m_BG_getWorld      = mof(k_BattleGame, "get_World", 0);
-        m_WB_getLogicWorld = mof(k_WorldBattle, "get_LogicWorld", 0);
-        m_Ctx_getEntity    = mof(k_Ctx, "get_Entity", 0);
-        m_Ctx_getBattleMgr = mof(k_Ctx, "get_BattleMgr", 0);
-        m_Ctx_getBattleData= mof(k_Ctx, "get_BattleData", 0);
-        L("A[M1] getWorld=%p logicWorld=%p ctxEntity=%p", m_BG_getWorld, m_WB_getLogicWorld, m_Ctx_getEntity);
-        g_rs = RS_M2; return;
-    case RS_M2:
-        if (k_EM) {
-            m_EM_GetEntityValues    = mof(k_EM, "GetEntityValues", 0);
-            m_EM_GetAllPlayer       = mof(k_EM, "GetAllPlayer", 0);
-            m_EM_GetPlayer          = mof(k_EM, "GetPlayer", 1);
-            m_EM_EnemyCommitSuicide = mof(k_EM, "EnemyCommitSuicide", 2);
-        }
-        if (k_Char) {
-            m_Char_SetHp        = mof(k_Char, "SetHp", 1);
-            m_Char_GetHp        = mof(k_Char, "GetHp", 0);
-            m_Char_OnDeath      = mof(k_Char, "OnDeath", 1);
-            m_Char_getIsDead    = mof(k_Char, "get_IsDead", 0);
-            m_Char_Suicide      = mof(k_Char, "Suicide", 1);
-            m_Char_AddAbsInv    = mof(k_Char, "AddAbsoluteInvincibility", 0);
-            m_Char_RemoveAbsInv = mof(k_Char, "RemoveAbsoluteInvincibility", 0);
-            m_Char_AddStatus    = mof(k_Char, "AddCharacterStatus", 1);
-            m_Char_getCurrentHp = mof(k_Char, "get_CurrentHp", 0);
-            m_Char_setCurrentHp = mof(k_Char, "set_CurrentHp", 1);
-        }
-        L("A[M2] vals=%p allPlayer=%p suicide=%p SetHp=%p OnDeath=%p absInv=%p status=%p",
-          m_EM_GetEntityValues, m_EM_GetAllPlayer, m_EM_EnemyCommitSuicide,
-          m_Char_SetHp, m_Char_OnDeath, m_Char_AddAbsInv, m_Char_AddStatus);
-        g_rs = RS_M3; return;
-    case RS_M3:
-        if (k_BattleMgr) {
-            m_BM_AddExpAndGold  = mof(k_BattleMgr, "AddExpAndGold", 0);
-            m_BM_OnMissionClear = mof(k_BattleMgr, "OnMissionClear", 0);
-            m_BM_OnChapterEnd   = mof(k_BattleMgr, "OnChapterEnd", 0);
-        }
-        if (k_BattleData) {
-            m_BD_AddUserExp   = mof(k_BattleData, "AddUserExp", 1);
-            m_BD_AddDropGold  = mof(k_BattleData, "AddDropGold", 1);
-            m_BD_AddWaveGold  = mof(k_BattleData, "AddWaveGold", 1);
-        }
-        L("A[M3] expAndGold=%p missionClear=%p AddUserExp=%p AddDropGold=%p",
-          m_BM_AddExpAndGold, m_BM_OnMissionClear, m_BD_AddUserExp, m_BD_AddDropGold);
-        g_rs = RS_M4; return;
-    case RS_M4:
-        if (k_ADMgr) {
-            m_AD_CheckAndPlayVideo = mof(k_ADMgr, "CheckAndPlayVideo", 2);
-            off_AD_onClose = foff(k_ADMgr, "_onClose");
-        }
-        if (k_GameMgr) m_GM_SetTimeScale   = mof(k_GameMgr, "SetTimeScale", 1);
-        if (k_Game)    m_Game_SetTimeScale = mof(k_Game, "SetTimeScale", 1);
-        if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
-        L("A[M4] adPlay=%p adOnClose@0x%x GM=%p Game=%p adShow0=%p",
-          m_AD_CheckAndPlayVideo, off_AD_onClose, m_GM_SetTimeScale, m_Game_SetTimeScale, m_Ad_Show0);
-        g_rs = RS_OFF; return;
-    case RS_OFF:
-        off_CurLogicWorld   = foff(k_WorldBattle, "CurLogicWorld");
-        off_BLW_worldCtx    = foff(k_BLW, "_worldContext");
-        off_Ctx_gameSpeed   = foff(k_Ctx, "gameSpeed");
-        off_World_timeScale = foff(k_WorldBattle, "_curTimeScale");
-        if (g_imgAD && !k_Ad_Local)
-            k_Ad_Local = cn(g_imgAD, "GorillaAd.Runtime", "LocalRewardedVideoAd");
-        if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
-        L("A[OFF] curLogicWorld=0x%x worldCtx=0x%x gameSpeed=0x%x timeScale=0x%x",
-          off_CurLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale);
-        // 入口可用性判定
-        if (!m_BG_getWorld && off_CurLogicWorld <= 0) {
-            L("A ✗ 无可用世界入口 → 功能不可用");
-            g_rs = RS_FAIL; return;
-        }
-        g_parsed = YES;
-        g_rs = RS_DONE;
-        L("A ✓✓ 解析完成 — 进入关卡后功能生效");
-        {
-            NSString *doc = dk_doc_path();
-            if (doc) {
+    for (int iter = 0; iter < 4; iter++) {   // 每轮最多推进 4 步 (加速完成)
+        if (g_parsed || g_rs == RS_DONE || g_rs == RS_FAIL) return;
+        switch (g_rs) {
+        case RS_WAIT_DOMAIN:
+            if (ic_domain_ready()) { g_rs = RS_HF; L("A[domain] ✓ il2cpp 域就绪"); }
+            else if (++g_rsFails > 400) { g_rs = RS_FAIL; L("A[domain] ✗ 超时"); }
+            return;                       // domain 未就绪时本 tick 结束
+        case RS_HF:
+            g_imgHF = ic_find_image("HotFix.dll");
+            if (g_imgHF) { rs_log("HotFix.dll", YES); g_rs = RS_HFB; g_rsFails = 0; }
+            else if (++g_rsFails % 10 == 0) L("A[HotFix.dll] 等待热更加载 (#%d)", g_rsFails);
+            return;
+        case RS_HFB:
+            g_imgHFB = ic_find_image("HotFixBattle.dll");
+            if (g_imgHFB) { rs_log("HotFixBattle.dll", YES); g_rs = RS_AD; g_rsFails = 0; }
+            else if (++g_rsFails % 10 == 0) L("A[HotFixBattle.dll] 等待 (#%d)", g_rsFails);
+            return;
+        case RS_AD:
+            g_imgAD = ic_find_image("GorillaAd.Runtime.dll");
+            L("A[GorillaAd] %s", g_imgAD ? "✓" : "✗ (可缺)");
+            g_rs = RS_COR; break;
+        case RS_COR:
+            g_imgCOR = ic_find_image("mscorlib.dll");
+            L("A[mscorlib] %s", g_imgCOR ? "✓" : "✗ (可缺)");
+            g_rs = RS_C1; break;
+        case RS_C1:
+            k_BattleGame  = cn(g_imgHF, "HotFix", "BattleGame");
+            k_WorldBattle = cn(g_imgHF, "HotFix", "WorldBattle");
+            L("A[C1] BG=%p WB=%p", k_BattleGame, k_WorldBattle);
+            g_rs = RS_C1b; break;
+        case RS_C1b:
+            k_BLW = cn(g_imgHFB, "HotFix.BattleLogic", "BattleLogicWorld");
+            k_Ctx = cn(g_imgHFB, "HotFix.BattleLogic", "BattleWorldContext");
+            L("A[C1b] BLW=%p CTX=%p", k_BLW, k_Ctx);
+            if (k_BattleGame && k_WorldBattle && k_Ctx) g_rs = RS_C2;
+            else if (++g_rsFails > 40) { g_rs = RS_FAIL; L("A[C1b] ✗ 类缺失"); }
+            break;
+        case RS_C2:
+            k_EM   = cn(g_imgHFB, "HotFix.BattleLogic", "EntityManager");
+            k_Char = cn(g_imgHFB, "HotFix.BattleLogic", "EntityCharacter");
+            L("A[C2] EM=%p Char=%p", k_EM, k_Char);
+            if (k_Char) g_rs = RS_C2b; else if (++g_rsFails > 40) g_rs = RS_FAIL;
+            break;
+        case RS_C2b:
+            k_Hero = cn(g_imgHFB, "HotFix.BattleLogic", "EntityHero");
+            k_TDD  = cn(g_imgHFB, "HotFix.BattleLogic", "TakeDamageData");
+            L("A[C2b] Hero=%p TDD=%p", k_Hero, k_TDD);
+            g_rs = RS_C3; break;
+        case RS_C3:
+            k_BattleMgr  = cn(g_imgHFB, "HotFix.BattleLogic", "BattleManager");
+            k_BattleData = cn(g_imgHFB, "HotFix.BattleLogic", "BattleData");
+            L("A[C3] BM=%p BD=%p", k_BattleMgr, k_BattleData);
+            g_rs = RS_C3b; break;
+        case RS_C3b:
+            k_ADMgr   = cn(g_imgHF, "HotFix", "ADModuleMgr");
+            k_AdData  = cn(g_imgHF, "HotFix", "AdData");
+            L("A[C3b] ADMgr=%p AdData=%p", k_ADMgr, k_AdData);
+            g_rs = RS_C3c; break;
+        case RS_C3c:
+            k_Game    = cn(g_imgHF, "HotFix", "Game");
+            k_GameMgr = cn(g_imgHF, "HotFix", "GameManager");
+            k_I64     = cn(g_imgCOR, "System", "Int64");
+            L("A[C3c] Game=%p GM=%p I64=%p", k_Game, k_GameMgr, k_I64);
+            g_rs = RS_M1; break;
+        case RS_M1:
+            m_BG_getWorld      = mof(k_BattleGame, "get_World", 0);
+            m_WB_getLogicWorld = mof(k_WorldBattle, "get_LogicWorld", 0);
+            L("A[M1] getWorld=%p logicWorld=%p", m_BG_getWorld, m_WB_getLogicWorld);
+            g_rs = RS_M1b; break;
+        case RS_M1b:
+            m_Ctx_getEntity    = mof(k_Ctx, "get_Entity", 0);
+            m_Ctx_getBattleMgr = mof(k_Ctx, "get_BattleMgr", 0);
+            m_Ctx_getBattleData= mof(k_Ctx, "get_BattleData", 0);
+            L("A[M1b] ctxEntity=%p ctxBM=%p ctxBD=%p", m_Ctx_getEntity, m_Ctx_getBattleMgr, m_Ctx_getBattleData);
+            g_rs = RS_M2; break;
+        case RS_M2:
+            if (k_EM) {
+                m_EM_GetEntityValues    = mof(k_EM, "GetEntityValues", 0);
+                m_EM_GetAllPlayer       = mof(k_EM, "GetAllPlayer", 0);
+                m_EM_EnemyCommitSuicide = mof(k_EM, "EnemyCommitSuicide", 2);
+            }
+            L("A[M2] vals=%p allPlayer=%p suicide=%p", m_EM_GetEntityValues, m_EM_GetAllPlayer, m_EM_EnemyCommitSuicide);
+            g_rs = RS_M2b; break;
+        case RS_M2b:
+            if (k_Char) {
+                m_Char_SetHp     = mof(k_Char, "SetHp", 1);
+                m_Char_OnDeath   = mof(k_Char, "OnDeath", 1);
+                m_Char_getIsDead = mof(k_Char, "get_IsDead", 0);
+                m_Char_Suicide   = mof(k_Char, "Suicide", 1);
+            }
+            L("A[M2b] SetHp=%p OnDeath=%p IsDead=%p", m_Char_SetHp, m_Char_OnDeath, m_Char_getIsDead);
+            g_rs = RS_M2c; break;
+        case RS_M2c:
+            if (k_Char) {
+                m_Char_AddAbsInv    = mof(k_Char, "AddAbsoluteInvincibility", 0);
+                m_Char_AddStatus    = mof(k_Char, "AddCharacterStatus", 1);
+                m_Char_getCurrentHp = mof(k_Char, "get_CurrentHp", 0);
+                m_Char_setCurrentHp = mof(k_Char, "set_CurrentHp", 1);
+            }
+            L("A[M2c] absInv=%p status=%p curHp=%p/%p",
+              m_Char_AddAbsInv, m_Char_AddStatus, m_Char_getCurrentHp, m_Char_setCurrentHp);
+            g_rs = RS_M3; break;
+        case RS_M3:
+            if (k_BattleMgr) {
+                m_BM_AddExpAndGold  = mof(k_BattleMgr, "AddExpAndGold", 0);
+                m_BM_OnMissionClear = mof(k_BattleMgr, "OnMissionClear", 0);
+                m_BM_OnChapterEnd   = mof(k_BattleMgr, "OnChapterEnd", 0);
+            }
+            L("A[M3] expAndGold=%p missionClear=%p chapterEnd=%p", m_BM_AddExpAndGold, m_BM_OnMissionClear, m_BM_OnChapterEnd);
+            g_rs = RS_M3b; break;
+        case RS_M3b:
+            if (k_BattleData) {
+                m_BD_AddUserExp  = mof(k_BattleData, "AddUserExp", 1);
+                m_BD_AddDropGold = mof(k_BattleData, "AddDropGold", 1);
+                m_BD_AddWaveGold = mof(k_BattleData, "AddWaveGold", 1);
+            }
+            L("A[M3b] AddUserExp=%p AddDropGold=%p AddWaveGold=%p", m_BD_AddUserExp, m_BD_AddDropGold, m_BD_AddWaveGold);
+            g_rs = RS_M4; break;
+        case RS_M4:
+            if (k_ADMgr) m_AD_CheckAndPlayVideo = mof(k_ADMgr, "CheckAndPlayVideo", 2);
+            if (k_GameMgr) m_GM_SetTimeScale = mof(k_GameMgr, "SetTimeScale", 1);
+            L("A[M4] adPlay=%p GM.SetTimeScale=%p", m_AD_CheckAndPlayVideo, m_GM_SetTimeScale);
+            g_rs = RS_M4b; break;
+        case RS_M4b:
+            if (k_Game) m_Game_SetTimeScale = mof(k_Game, "SetTimeScale", 1);
+            if (g_imgAD && !k_Ad_Local) k_Ad_Local = cn(g_imgAD, "GorillaAd.Runtime", "LocalRewardedVideoAd");
+            if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
+            L("A[M4b] Game.SetTimeScale=%p adShow0=%p", m_Game_SetTimeScale, m_Ad_Show0);
+            g_rs = RS_OFF; break;
+        case RS_OFF:
+            if (k_WorldBattle) off_CurLogicWorld  = foff(k_WorldBattle, "CurLogicWorld");
+            if (k_BLW)         off_BLW_worldCtx   = foff(k_BLW, "_worldContext");
+            if (k_Ctx)         off_Ctx_gameSpeed  = foff(k_Ctx, "gameSpeed");
+            if (k_WorldBattle) off_World_timeScale= foff(k_WorldBattle, "_curTimeScale");
+            if (k_ADMgr)       off_AD_onClose     = foff(k_ADMgr, "_onClose");
+            L("A[OFF] curLogicWorld=0x%x worldCtx=0x%x gameSpeed=0x%x timeScale=0x%x adOnClose=0x%x",
+              off_CurLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale, off_AD_onClose);
+            if (!m_BG_getWorld && off_CurLogicWorld <= 0) {
+                L("A ✗ 无可用世界入口 → 功能不可用"); g_rs = RS_FAIL; return;
+            }
+            g_parsed = YES; g_rs = RS_DONE;
+            L("A ✓✓ 解析完成 — 进入关卡后功能生效");
+            {
                 NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
                 [ud setInteger:0 forKey:@"dk3_crashStreak"];
                 [ud synchronize];
             }
+            if (g_statusSub) g_statusSub.text = @"已就绪，进入关卡后生效";
+            return;
+        default: return;
         }
-        return;
-    case RS_DONE: case RS_FAIL: default: return;
     }
 }
 

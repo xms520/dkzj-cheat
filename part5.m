@@ -229,6 +229,8 @@ static UIWindow *dk_game_window(void) {
 static void dk_build_ui(void) {
     UIWindow *win = dk_game_window();
     if (!win) { L("UI: 游戏 window 未就绪"); return; }
+    // ⚠️ 必须初始化: 所有 addTarget:g_helper 的 target 为 nil 时点击/拖动全部失效
+    if (!g_helper) g_helper = [[DK3Helper alloc] init];
     CGFloat W = MIN(302, win.bounds.size.width - 24);
     CGFloat x0 = (win.bounds.size.width - W) / 2;
     CGFloat y = 76;
