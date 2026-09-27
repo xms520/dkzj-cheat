@@ -372,6 +372,9 @@ static void *m_CTX_AddExpAndGold;       // ctx.AddExpAndGold()
 static void *m_CTX_OnWaveEnd;           // ctx.OnWaveEnd()
 static int32_t g_myPlayerId = -1;       // WorldBattle.MyPlayerId (字段直读)
 static void *m_Ad_Show0;
+static Il2CppClass *k_Ad_Fallback = NULL, *k_Ad_Player = NULL;
+static void *m_Ad_Fb_IsReady, *m_Ad_Fb_Show4, *m_Ad_Fb_Show0;
+static void *m_Ad_Pl_Close, *m_Ad_Pl_Skip;
 static void *m_GM_SetTimeScale, *m_Game_SetTimeScale;
 static void *m_UO_FindObjectOfType;
 
@@ -586,9 +589,23 @@ static void resolve_step(void) {
             g_rs = RS_M4b; break;
         case RS_M4b:
             if (k_Game) m_Game_SetTimeScale = mof(k_Game, "SetTimeScale", 1);
-            if (g_imgAD && !k_Ad_Local) k_Ad_Local = cn(g_imgAD, "GorillaAd.Runtime", "LocalRewardedVideoAd");
-            if (k_Ad_Local) m_Ad_Show0 = mof(k_Ad_Local, "Show", 0);
-            L("A[M4b] Game.SetTimeScale=%p adShow0=%p", m_Game_SetTimeScale, m_Ad_Show0);
+            // 免广告第二入口: FallbackRewardedVideo.IsReady()→true + Show(...) 直接发奖
+            if (g_imgAD && !k_Ad_Fallback)
+                k_Ad_Fallback = cn(g_imgAD, "GorillaAd.Runtime", "FallbackRewardedVideo");
+            if (k_Ad_Fallback) {
+                m_Ad_Fb_IsReady = mof(k_Ad_Fallback, "IsReady", 0);
+                m_Ad_Fb_Show4   = mof(k_Ad_Fallback, "Show", 4);
+                m_Ad_Fb_Show0   = mof(k_Ad_Fallback, "Show", 0);
+            }
+            // LocalRewardedVideoPlayer.OnCloseClicked/OnSkipClicked (本地视频"点击关闭")
+            if (g_imgAD && !k_Ad_Player)
+                k_Ad_Player = cn(g_imgAD, "GorillaAd.Runtime", "LocalRewardedVideoPlayer");
+            if (k_Ad_Player) {
+                m_Ad_Pl_Close = mof(k_Ad_Player, "OnCloseClicked", 0);
+                m_Ad_Pl_Skip  = mof(k_Ad_Player, "OnSkipClicked", 0);
+            }
+            L("A[M4b] Game.SetTimeScale=%p fbIsReady=%p fbShow4=%p plClose=%p",
+              m_Game_SetTimeScale, m_Ad_Fb_IsReady, m_Ad_Fb_Show4, m_Ad_Pl_Close);
             g_rs = RS_OFF; break;
         case RS_OFF:
             if (k_WorldBattle) off_CurLogicWorld  = foff(k_WorldBattle, "CurLogicWorld");
@@ -841,6 +858,23 @@ static void ad_replacement_show0(void *self) {
     if (l <= 6) L("⑤ noAd: LocalShow 发奖 %d 次", fired);
 }
 
+// IsReady() → true (让游戏认为"本地兜底视频已就绪", 从而跳过 SDK 广告请求)
+static int ad_ready_true(void *self) { return 1; }
+// LocalRewardedVideoPlayer.OnCloseClicked/OnSkipClicked → 直接当作已看完
+static void ad_player_close(void *self) {
+    static int l = 0;
+    if (l++ < 6) L("⑤ noAd: 拦截 LocalRewardedVideoPlayer 关闭(self=%p)", self);
+    // 尝试触发 OnRewarded/OnClosed 委托
+    const char *fns[] = { "OnRewarded", "OnClosed" };
+    for (int i = 0; i < 2; i++) {
+        int32_t off = foff((Il2CppClass *)I.object_get_class(self), fns[i]);
+        if (off > 0) {
+            void *d = *(void **)((uint8_t *)self + off);
+            if (d && looks_like_delegate(d)) delegate_invoke(d);
+        }
+    }
+}
+
 static void ad_hook_install(void) {
     if (g_adHooked || !g_parsed) return;
     if (m_AD_CheckAndPlayVideo) {
@@ -850,15 +884,25 @@ static void ad_hook_install(void) {
     if (m_Ad_Show0) {
         if (dk_hook_method(m_Ad_Show0, (void *)ad_replacement_show0, "LocalAd.Show")) g_adHooked++;
     }
-    L("⑤ noAd: hooked=%d (play=%p show0=%p)", g_adHooked, m_AD_CheckAndPlayVideo, m_Ad_Show0);
+    if (m_Ad_Fb_IsReady) {
+        if (dk_hook_method(m_Ad_Fb_IsReady, (void *)ad_ready_true, "Fb.IsReady")) g_adHooked++;
+    }
+    if (m_Ad_Pl_Close) {
+        if (dk_hook_method(m_Ad_Pl_Close, (void *)ad_player_close, "Player.OnClose")) g_adHooked++;
+    }
+    if (m_Ad_Pl_Skip) {
+        if (dk_hook_method(m_Ad_Pl_Skip, (void *)ad_player_close, "Player.OnSkip")) g_adHooked++;
+    }
+    L("⑤ noAd: hooked=%d (play=%p show0=%p fbReady=%p plClose=%p)",
+      g_adHooked, m_AD_CheckAndPlayVideo, m_Ad_Show0, m_Ad_Fb_IsReady, m_Ad_Pl_Close);
 }
 
 static void ad_hook_remove(void) {
     if (!g_adHooked) return;
-    dk_unhook_all();
+    dk_unhook_all();      // 当前只有广告 hook 使用该表, 安全
     g_adHooked = 0;
     g_ad_mp_slot = NULL;
-    L("⑤ noAd: 已移除");
+    L("⑤ noAd: 已移除 (hook 表已清空, 可重新安装)");
 }
 
 // ───────────────────── 功能 ① 怪物自杀 / 秒杀 ─────────────────────
@@ -1202,7 +1246,7 @@ static void combat_tick(void) {
                 });
             }
         }
-        // 免广告 hook 状态同步 (只在开关变化时)
+        // 免广告 hook 状态同步 (开关变化时; 重复安装由 g_adHooked 幂等保护)
         static BOOL adInstalled = NO;
         if (g_noAdOn != adInstalled) { do_no_ad(); adInstalled = g_noAdOn; }
 
@@ -1221,14 +1265,18 @@ static void combat_tick(void) {
 }
 
 // ───────────────────── UI ─────────────────────
-#define DK_TEAL   [UIColor colorWithRed:0.243 green:0.714 blue:0.761 alpha:1]
-#define DK_TEALBG [UIColor colorWithRed:0.874 green:0.953 blue:0.961 alpha:1]
-#define DK_RED    [UIColor colorWithRed:0.992 green:0.906 blue:0.906 alpha:1]
-#define DK_BLUE   [UIColor colorWithRed:0.910 green:0.941 blue:1.0 alpha:1]
-#define DK_GREEN  [UIColor colorWithRed:0.910 green:0.973 blue:0.933 alpha:1]
-#define DK_GOLD   [UIColor colorWithRed:1.0 green:0.949 blue:0.855 alpha:1]
-#define DK_TEXT   [UIColor colorWithRed:0.10 green:0.10 blue:0.12 alpha:1]
-#define DK_SUB    [UIColor colorWithRed:0.55 green:0.55 blue:0.60 alpha:1]
+// ── 黑色面板主题 ──
+#define DK_PANEL  [UIColor colorWithRed:0.07 green:0.07 blue:0.09 alpha:0.97]   // 面板底
+#define DK_CARD   [UIColor colorWithRed:0.13 green:0.13 blue:0.16 alpha:1]      // 卡片底
+#define DK_CARD2  [UIColor colorWithRed:0.18 green:0.18 blue:0.22 alpha:1]      // 卡片底(亮)
+#define DK_TEAL   [UIColor colorWithRed:0.24 green:0.78 blue:0.85 alpha:1]      // 主色(青)
+#define DK_TEALBG [UIColor colorWithRed:0.16 green:0.28 blue:0.32 alpha:1]      // 主色浅底
+#define DK_RED    [UIColor colorWithRed:0.30 green:0.14 blue:0.16 alpha:1]
+#define DK_BLUE   [UIColor colorWithRed:0.14 green:0.19 blue:0.32 alpha:1]
+#define DK_GREEN  [UIColor colorWithRed:0.13 green:0.26 blue:0.20 alpha:1]
+#define DK_GOLD   [UIColor colorWithRed:0.30 green:0.24 blue:0.13 alpha:1]
+#define DK_TEXT   [UIColor colorWithRed:0.96 green:0.96 blue:0.98 alpha:1]      // 主文字(白)
+#define DK_SUB    [UIColor colorWithRed:0.60 green:0.62 blue:0.68 alpha:1]      // 副文字(灰)
 
 @interface DK3Helper : NSObject <UIGestureRecognizerDelegate>
 - (void)ballTapped;
@@ -1298,6 +1346,56 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
 @end
 static DK3Helper *g_helper = nil;
 
+// ───────────────────── 头像 (base64 JPEG 内嵌, 31 段) ─────────────────────
+static UIImage *g_avatarImg = nil;
+static int g_avatarTried = 0;
+static UIImage *dk_avatar_image(void) {
+    if (g_avatarImg) return g_avatarImg;
+    if (g_avatarTried) return nil;
+    g_avatarTried = 1;
+    NSMutableString *m = [NSMutableString stringWithCapacity:18080];
+    [m appendString:@"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCAEAAQADASIAAhEBAxEB/8QAHQAAAQQDAQEAAAAAAAAAAAAABgMEBQcBAggACf/EAEMQAAEDAwICBwQIBQIGAwEBAAECAwQABREGIRIxBxNBUWFxgRQikaEIFSMyQlKxwTNicoLRJOEWQ1OSovAlRMJzsv/EABsBAAIDAQEBAAAAAAAAAAAAAAMEAQIFAAYH/8QAMxEAAgIBBAECBAQFBAMAAAAAAQIAAxEEEiExBSJBEzJRYQaBkaFCUnGx0TNi4fAjJMH/2gAMAwEAAhEDEQA/AOs11EXu6phMrS2sdYBlSj+D/enN5nJhME8QCyMjP4R31VmpbyqStTTSj1YO5zuo95oF94QYEZ02nNhyeoz1Dc1zZBShRKc9+STUeGiw"];
+    [m appendString:@"grzlfarsT4Dxpe3xytSpDh4W081H9qdR43t7vFjgjo5DvrLILHJ7myCqjA6kMiG7JUVYITnnWJjCIqcc1nkKI5LrEaOt4J+yQeFA/Or/ABTa2WpT6jcJwPEo5QmpKYOB3OD5GT1B5EFfD1z2eI/dFNZERaiSaMpEMrUVEUxlxkNoKlYArvhYkC7Jge5EIJ2NYTBUo4IO258KJREKw2UJy47/AA0+H5j4UxvJbiMmM0rKvxr7zVCkKrwdktcS+pZGTyzTe6tItkTjd/iHkKL9PWxCYDt1kjDSQVAnuHbVTdIOoA9Jee4jwJOG0jtqjV4H9ZdXyT9pBalvKkLKUnicVyT+9V7dr1xylNhSn3En3sAkDwFTSI8i6SVIJV7x+0UD/wCIotsmmo0doJSwlPkKNWFQRe1y54lYpntO/ZvApJ7xg0daV1tItGi3LWHCH2ZKlNOZ5JUkDI8dsUe2zRrd4Ps/sLb6DseNAIqyNA9BulLdLTPmW1Elzmlp5RW2jySdqlmDDEotnw+TOWjfb0ZJlNNzHE5yVJBA+dWjo7Wn1pb24N2UXGj7qXD95s9x/wAV0Xd+jDRk5koXY4zRI+80nhPy"];
+    [m appendString:@"qrdWdCCITjk3Try0q/Eys5SsfsfGhNx0IRL1bgmBt6gFhwqQeJCt0qHIioRzIJqciPSIb7lkvDam1pPCgrG6T/io+6RVMPKSRQ8DsRnMjFnHbSSiRWz2UmklHO4NSJUxUOhQ4V8u/upJWWnNj5GtVEEYzg0kXCPs3Dt2Huq4lSMwh01qGfZbi1OgSVx5DSspUk/+5rqLoy15C1jbcKKGLmynL7A5K/nT4d47K47CiFYOxFTemb9Osl0YnwX1svsqCkqB/wDcjwpyi4rM/VacP13O2FE1jioe6PNWQtYafRPY4W5KMIksg/w1+H8p7P8AaiBYrSBBHExypBwZtxV7NaAVk12Z08o17GRWvbSmNsVw5nGV5rHUCpC1ttuZBO576GbcyudMS2ORO9RMyXxKKirmanhxWa1JaVtPlJyodrSDyHnWIX3nJnoxWK12iLy3EPyBCYOGW/vEfiNKOyusWm3xVcCQMur/ACioF6Z7IyENnLy9h35qStUcNxftl4SfeeX3+FWBx/WVK/pJaDFRNdEl8cMNn3WUfm8al/4pyQAkbAdwqKhSFSlggcLKdkJqXLqEN5JwBRUHEXtY5xG80tMt"];
+    [m appendString:@"KWogJA7aDETkXi5u8PF7BFILpT/zFdiB4k/vUb0iapdflJstsy486oIwnmSdsUUaPtbFttzfWYLELKlq/wCs+fvHxA5Dy8aqzbjgQqJsXc0VuP8A8bCU8/w+2vjJA5Np7Eiq7uL7s+6x7awftZLyWx4ZO59BvU9rC7qecdcWqhzotH1trp+Uo5biNhCT3LXsT6JCqG2M7RCoCAWMJ+l66tWTTUSyxCEqeQCrHMIGw+Nc2XR9253MNtkkBXCjz7VelH3TPqNVzv0x1peUlfUsDuSNhQxoy2cZ9qIyFbI/pHb6864nJLSfkULJvTdmQwwkBPLto701p924yEoSkhAIyaQ09bFy5CGG08yMnuq6tJWJqEwjhbAI7cVQcwDvtm+mdOx4DKAlsAgd1FrDQQnAGMVhhkJHKlzsMVfGIqWJmixkYNNH0A5zTsmkXd64icOJWPSzoVrUFtVMgthFzjjibI260fkP7eNUah1chkxJQUl9r3RxbHbsPjXWclOQapDpu0p7LI/4mt7WG1qAmJSPuqPJz15Hxwe2gMMGaGnsz6TKkloKVFJHKoxxwsuY/Cam5461HWjnjeoSejiScVZe8Q7c"];
+    [m appendString:@"TYLCxkV5RStJQvl2HuqOiSclSc4Uk4Ip2VgjIq2CDK5yJopZaV1bnMfdPeKcsKzgik0NplNlhRwrmhXcaZMSFsSFMujhKVYIPZRlGORAsfaWP0XavlaR1GzNbKlxl4RJazs4gnceY5jxrriHJjz4TM2I6l2O+gONLTyUk8jXDsQhYGDXQn0cdUrejvaVmu5U2C9DKjzH40D/AP18aepbHEy9VXn1CXFivHurKs5rWmTERPAb0oBWo2FbpziuE4zn/SDCCF6huI/0kdXDGbP/ADnf8CsT7gt156bJXlajn/as3m4NSFtxoqeqgRU8EdvuHefE0OSnzMlhhs/Zg71gA+09SRk5kzZuKVJVMf5DZI7qmFylSHhGbP2aT72O2oRT6Y8bhRslIwB3mpKzJ4UdYr7xqQZVh7wphKS02ANsUO9IGqU2u3LbbWOuWMDwpa6XRuDCW8tYASKpLVF2lXu8pZaytx5wIbSO8nAozPgYEDXXk7jDXoshP3O7PXt0KU4FFqMT+c/eX/aD8TVlajmtxISLfHV9m0ME957TUZoyCzZLGgIOzLfVNn8x5qV6nNQmobhkrPF21CkBcyzgs2PpBXWl"];
+    [m appendString:@"06qO6SrfFLdFsg2vQ10vZJDrwcWg+Kvs0/IKPrQB0gXQqWtIVnFFk6R9WdGUGCMpU7w8XklP+SaGD7wuOMSvbstdwvBaQScEIHmeZ+FWHp2AGmEJSnlgAUDaRjmTdOtVvjKvUnb5Crg0nD6+4MR0NLedJylptPEpXpUtxgQDNnmWB0c2JLTQfcR7yt6syGyhCcAVGabsNzRGR1qGYqcfdUeJXwG3zohRbHUjeSkn+j/eirU/0iD2qT3EwKwsbUsqG+ge6pC/LY03WSDwrBSe41DKy9iVDA9TVW2aRWd63WaRdVVMy0Rf3qIukVmVFejSG0uMuoKFoUNlJPMVKuK7M0xkqBzVGhUJE5k1pYHtOX1+3L4lMH347h/G2eXqOR8RQhMRwqUk8q6W6SNITNTWbrIUJ52TGJW0pKDuPxJz4/qK5zu7Km1KCgQpJwaqARNFXDj7wHvr6rZdo8k7R5P2a/5VjkfhU0w5xoC0nINRetI3tVikpAytodcn05/Ko/RV0MiMI7isrSNvEU0y7kDRdW2uUMJ0uFKwQcHnSmoY4fgouzI95GESAO7sVSDo2yKlNOPNOOriSN2X0ltYPjXVd4M6"];
+    [m appendString:@"4EciR1gnDiDTh8jR/pe5v2i6xLtDUQ9GcS4MHng7j1G1VVJYdttyfhuEhbDhSD3jsPwoy0vcUvpCVHfkaOnpOItYNwzO3bbNYudsjXGKoKYktJdQfAjl6cvSlwMVWv0fb0ZmnpNjeXlyCvjaB/6a/wDCs/GrLI3p4HImUy7WInhit8bVpilByqRIM5Su03qm+qQfeVzrNob4WutVnK/0ofW+t+WASSpagKIJkhEOGVZxwjCRXnB7Cesi5k+1XhEVs5QwnjWf5uQH/vdRG26ltvGcYoP0clRjOTXMlch0qB/lTsPnmn1+ugjxlIQr31CiKecyjLxiQuvr4XSqO2v3EczUF0XQVXDUzk9YJTGGEf1q2HwGT8Kh9SyiQRndR3qwOiuGIVgaeWMLey6r15fLFWb+8gcflDu5yw1GSyg4SgYqvdU3HgacVxUQ3qZ7qsGqt1hPJUtAPKpY54EqgxyYI6hfMmYlGSeNxKfioCjrpBkFu1xY4P3Gdh5mq1LnWX+2sk7rlt5+OaOtdOhyc012JCAR4AZqzLhgJwb0kxXQLEh+T7JBb45DiwCrGQ2OQ8yewV2P0U6HjacsyHHG+Oa8Ap51"];
+    [m appendString:@"W6lHuz3CqW+jDpJtyVGkPtklI9qdJ7Vk7fD9q6oPChoJA5Cnqqgvq95i6m4sdo6jYhKRik1Het3DnNIqzTEUmFLx203kpS4khQzW66ScNQQDwZIOJHLyhzq1cz9099Iujal7o31scgKKVjdKhzB7DUfDme1xONQCXUkocT3KHOkLq9h46jdT7hE31Eq4Ug5J2AqftVkajNpkT0Bx47ho8k+feaT0vBS5KXNdTlDP3c9qv9ql5ThUokmr6ekEb2kXWkelYhJeURwjYDkBsBXL30hdJizah+tYrXDBuJKsJGzbv4k+v3h5nurpp886E+kKwM6m0zLtToAWtPEws/gcH3T+x8CaPdXvXErpbjVYD7TiK4tZK2l8lAoPkRioC46cctdtt+pLahQjPtp69A5NrHuq9CQfKi/UkN6K+8w+2pt5lZbcSeaSDii3o1gMXnQ8mE+2HENSnWyk/lUAv/8ARpbT8gqZo6r0kOJXkGQmSwHB2jcUqy4WJAION6Tu1nkaXvzkB4KMdz3mVntT/kV6QMpyOzcVQrtaGDCxMxfpFCQq1XoD3JSTGePc4ndJ9RmmFklmLLSrOx51JXhBuvR7dYnN"];
+    [m appendString:@"2IlMxrvBQfex/aTQnZJYlQkLzladlUweQGigOCVnTHQXfBC1nAWV4ZmAxXd9ve+7/wCQFdLEb1w5oK6OICShZDrKgtB7iDkV25apiLjaodxbwUymEPD+5IJ+dMVNkRHUrhsxU91bisKFeFGi84q066mTfCAcpZbKz58hS+pppKV8J91A286g+jx8utXWUDsFIZB8cEn9qeTft58SLz66QhJ8uIZ+VefIw09ZnKwxiqTAtzLJOCyylHrjJ+eaG7nJW84pajUjdHy44vfYqJofujoQws9wqEnN3Bm6qMq4JYSSStYbHqcVcltUmNb0NI2CUgDyFU5ppPtWroSCMhKy4f7QT+uKtd54IY54Aqzn1ASqj0kxlqGf1TCyTv2VV97kF15WTnfJom1PP6xakhXuigq6u8LS1nmdhRKxk5MFYeMSKsqHZmtISmwSiM4HVnuAOB8zRzqZJkX1tgZ4lkJHrgfvSXR3YVNabl3h5B45HvoJ58CTt8dzT9LftGure32F1BPxz+1XzmwCU6qJnW/QJbUxLC5I4cFaghPkkY/zVmPOeNDPRzF9l0pDRjHEjiPrvT3VtwctWmLtc2U8TsOE8+gd"];
+    [m appendString:@"6kIKh8xWkOBMA+poN9InSZZNGMKXKjy5y0q4FIjJThJ7ipRAz4DOO3FMujPpe0hr+Uu3Wx9+JdEJKzBmJCHFpHNSCCUrA7cHI7q5D19reXfmmW3HFFttACRnt5k+ZJJPiaDdOXmbZNWWq9W5xbcuHNaeaUk75ChkeRGQfAmg/GOftNIaJdnPc+lTnLNNXO2l3VA5IGAezupstVMTLiEj7pFCjbpiandjnPVym+MD+ZOx+RHwoofOxoLv7nDqGCtPPjWn04KX1X+mTGNP8+JZ9qT1NjYwN3PfPr/6KZ3efEt8J6bOktRozKStx11QSlAHaSadxXAbTExy6hH6Cubvpk6tdtzEHT6OLhkxlSOe3Fx8IJ78AHHdxZogIVBKqhssxDdnp16MZV2+rk6mbbWVcCXXmHG2Sf6ynA8zgUerUh1oOIUlaFDiSpJyCDyIPaK+Z7zqlOFWedddfQ41RNu+gp9imuLdFnkJRGWo5IZcSSEeSSFY8DjsqqWFjgw+o0y1ruWQ/wBJHTIiXdF+jN4YnfZv4HJ0DY/3AfEGoH6P6esjXyMR9yQ0vHmhQ/8AzXQWvbExqHT0u1P4AfR7iz+BY3Sr"];
+    [m appendString:@"0PyzVH9BFtlQbtqhiW0ptxh9lhxJHJaePI/976oE225+sv8AF36fB7EU6U9LfW1pWWkf6ln7Rk47R2evKqXjkqaKFghaNiDzFdYXKGl1hQIztXOnSfa0WTVYUkcCJvEtI7OIY4v1Brr14zLaSznbI3SpR9ZKiO/wpCFMqHgoEH9arDT7y7fdXoLxxwuKaVnsIOP2qw2FFiW26nbCgc0Ca6jeya4ufAMJU/1w8lgK/eur5UiWuG1wYdaXkmNcRk4SrnXa/QlcRceji3jiyqMpcc+QOR8lCuErLJDsdl8H3hgK8669+itcvaNO3SCVZLTrbwHgoEH9BV6jhsQOpGUzLiO3OsVlZrWmYhOFejuOqNoSK+5s5Odckkfy54U/JOfWnEF0O6zgtA5DQW6fRB/2qQmpj2+G1Cjq/wBPDZQw2e9KEgZ9cZ9aH9GO+0ayfWTkohur8slI/esM87mnqhkYBhPMWcnehzUL3DGUAeZqbmLxnehHUz+Ns7Dc1FS5Miw4E36OQHdVPr/6MYnyKlAfsaNr1M4GihJ3oE6Ill6fepW+B1TYP/caIr2/gq3rnGbDJU+gSCujvG4RnzqHbt7l6vEa"];
+    [m appendString:@"1M5AdV75H4UD7x+H609luABSjzo46J9PqRHVepLZD0rZoEbpaHL48/hRSdoxAHnmGVtsIdtS7ZEa5x1IQkDkAk4qubJg9IFtKs74PrwmunOjiw8H+tfb3VjAPdVA3qwvWjpmlWoIIVFdcWz4pCuJHxSRVEO07jKKwYMk7MsCA1ZoqB2NJHypaU21Ijux32w406hTbiDyUkjBHqCabWJ5D9niPNnKVtJI+FOlnetcciYJ4M4i6V+hPV2mLy+LTaJt5sy3CYsmI0XVJQeSXEp95KhyzjBxkHsqW6BegrUV11VCv2rbU/arLBeS+GZSeB2WtJylIQdwjIBJONhgZzt2GTg9ua1Ks5ofwlBzGzrLCuJh4lRPeTk01cOO2lnF47aZvr351cmLARCW4EoVvQPOX7TqaM2MkNoU4r12H6GiS9zENsLKlhIAJUT2DtNDmlmHJkmRdnEKSH1YbB7EDYUlqrQRsEd09RGXMsuzOh2xRt/ebT1Z9P8AbFU19KXo2n63sMS52Jj2i7WzjHUAgKkMqwSlOduIEZA7ckc8VaNhlBh1cZZwhw5T/VUhIIJNGqcOgECwNVm4T5up0xe3br9WIslz"];
+    [m appendString:@"M7j4PZ/ZHA5nuwRtXYP0c9BytC6NcRckpRcp7ofkIByGwBhKM9pAznxJq1nSFbqOTTZ0gUVUCzrrzYMRCSAoHNQVytrIdckMNIQ44oKdKUgFZAxk95wAN+6pp1XOmUlexGaJiLZxIVbWUEEVRH0g7WudOjmOPtYbZcBH5lHl8B86v+Wpphh2S+oIbbSVKPhVV6hjquTkmS8j3nlE4/KOQHoKV1T7VxHNGpLbpQkR32iKFYII7O6h3pKQDqOO9j+PAaUfEjKT+lF19t67Pf3WSnDLx4keB7R+9Q3SDAU5bLRdACQhxyIs/wDmn96HQ3EdvXdgyF0g+eJyMvY4yB4iup/ogzj/AMQ3GEpWz0HIHilYP6E1y99WzoCIl7MZaYDj3soex7pdShKinz4VA1fv0WJhY6UYrOcJfZeb88oJ/ajKcPF7RmszrVYrAFbr768BtvTczJwNqa5pSlTaVZJ7B21r0ZW2eJs+/Po4YrjBjtk/iPECSPAY51aNt6BrnEsX1/q1zqXFrAbt6TlZB7XCNkj+Ub95HKpPVFkRbdFIkMtBtpMpLICRgfcJwPhWNYpRcT0iWq7gg5lc3FeAo1XuqpDj"];
+    [m appendString:@"y+oZBW66oIQkcyScAUaXx7q47hzTTowsKr1qZd1eQVR4Rw2CNi4e30HzNRWdozLWST01Y06atSYSgOuW2lx5X5lnOf8AFRV7eBdUM0fdI0VVruYacBSow2XCO7i4jVYSRIuFwRCiILr7yuFKR+/cO01VOSWMufkAEc6Ws7mob2mMUkxGiFyFfy9ifM/pmuitE2EzJKEhvDDWM4G3lQ10caRFvhM26OkreWrjfdxupR5n9gKvvTFnZgQ0NoSAQNz313zmKXWY6kjbIqGGEoSMAUDdIfR8i7awgathECUwwY0lrH8VORwrB70jIPeMd1WQhISMVqrBojAYxFEYq2RGdrzBZDZH2XM/yn/FSBcSoZSoEGkcAU1fjLAK4boaXzKFDKD/AI9PhRq79gweoF6txzHq1Ab5pJTgHbUPJnXGMD7Tb3yB+NkdYn5b/EVHPakYScHrUnuLK8/pRTqqx7yF0rnoQgfeAzvUVOmpQlR4gMDJJ5CotVynzBwwLXNkE8lKR1SPUqx+lYTp96YoL1BKStAORCjE8H96uavkKQ1HkAoyP1PUeq0QHLn/ADIoNydTy+qj8QtqF/au/wDWI7E/y+Pb"];
+    [m appendString:@"RgxBRGYS2gBKUjApVtYYYSzFZRHaSMAJFM5LijnJJPiaw7fLInKgsf0jYpNhwOBMPgcWM/Osm6lnCJfugnAc7D59xqMkuL3waaqmuJQpCkpdbIwpCxkEVGl84pbkYl7PH5H1hEqYhYyFg+tIuPpI55oTEdLzh+q56obvP2d4caD/AEnmPj6VspWo2Nlwo8gfmbkYz6EV6WnXK4zMq3RlTgQgdezsKayHGWGVvyXUNtp3UpRwBUG5M1GoFLdujMfzLdK/kAKj3rVcJbgduUpTygcgckp8hyFGbVqPl5gRpT/EYhfbou7OpZZSpuGhWUpIwXD+Y+HcPWmaooW2RiphNvQ0MYrVTISeVJsxY5MbUBRgSstc6PXemXERU/6pKSpnxUBkD15etAN0tTk/oXmTFNKC4t2aUARuMcKFD/z3rpSGw31gWUDPfURr2xtztG3iDGjoCnWeJKEJAy4XEHO3aTRa1xOa3PEG4XRz9b/RElMojlVx9ocvUXb3ste7gf1NpWPUUAfRik56UNOqBPvOFB/7FCuzLDa2LPYYFnbSFNQ4yGMHkrCcH4nPxrlXo70uvSf0pRp1KFJYjXJb0bxYWhS0"];
+    [m appendString:@"H4HHpTrpgqYrVZuVx+c6zX92sA7c62VyrUDINMRGMtdMdfYVoxnCwarXpotgh9EsfhGCic2tX9yVCrfujIfhrQeWQaCOmyJ7T0VXVIGeoS28P7VDPyJpDVDn8o9pGwVH3nGGqXVqww0CpxZwlI7SdgKu7oZ0oI0ODbwnJ2W8rvPNR+NVvoHTj2oNRTLotBMK1lCSewurzwj0AUr0FdOdFtsDTS5RTj8KfSkuzial7bVlH/SfX7Jrh2O2klRixkISkZJ93YAetZ0BoJ2xhD1zZ/8AmHwOsQd+oB5N+ff47dlXpcejqFcelxrXVycbkMxIbaYkUpziQnI6xXYQkY4R379gpKy2oSL9LnPpJw8rgz586hgehKDUDYB9BHejrAiBHC3Eguq3UaLmkhKaSYQEJxtW6lY7aIOIkxLHJiqiMYpNRrTjNaKWc1xM4TcnJwOZNOnoaERus41lXyprG959GR25p084T9nnbhJqFwc5ksCMYkc1KC+LhVkpOD4GtlPE8yTQvKn/AFfqBfGcNPJwrwI5GnVwu7cSMJZyWkn3yN+EHtpG/VGqtm9xHU0xZhj3k06XFDAJApMM47BTW3XmNKaS"];
+    [m appendString:@"424hxCuSknINS8dcd7GFpz41i1ldU24tk/eEcNVwRI91JAO1R8lJGaKFRG1IyCKirlGShJ5VGr0DquZNF6k4g0+OdR0lJ3NSUshKyM1GS3QAa8+QQZsJGEltKk77Ebgjsp1aryULEaYvOThLh/eo2ZLQkElQqOLzEgnKio9ya2PHai1WwDBailWXkQ+WUlOdqaPEb1A6bvJdaVGcXxhCsIXnmKmVr4gSDXrK23KDMKxCrFTGz2N6ZO86dPqO9NVbmriUxFoh3FEGmYyJN3aS6gLQPeIPLbcfMCoOIgE0XaKYPtjjuPuN/rTVAywi9xwphKsnOSaFp2i4EvpPtuvOuUiVCgORFNBGzpOeBZPYUhSx45HdRUsVpitEjMQBI6mSqsDJr361sBUiRHzoBBHfUVf7e3d7BcLS6QETI62So9nEkgH0ODUqsb02d91WKX1C5GYalsGVNoLQT+kuiT2C4NoF2flqmzOAhWFE8KU5HPCAPiaPdMRxGtjTYGNsmpKalLzC21bhQ3pvHHVN8I5Cs8rgx4uWHMeLI4T5VHtMIacUUjGTmnBcpNah31xlJuSANjWpV30l1nPetCvxqDJi2axk"];
+    [m appendString:@"UgXPGsdZ41UmXVY/hBReUQCeFJO1KuJUkLeWkp93hSCNz3msWY5Lyx3AVm5rPVmpX5cyGPqxK01yrilKxkHhPKojSl7cda9lfWQrHuqNSOr18UtzJ5CgW3OKbUlxJwQazLly5H1m3pxmmGj9ujTluSbbNfsV0Cj1imEhbLiu9xk7HPekpPnTB++a8sW9w081fIqf/tWZ3iVjvUyvCh6E0opL81hMyCsCY2MFJOA6n8p8e40lC1Clay24VMvoOFNr2KTXntTU+nbDruX2Pv8AqJoUkWDjn7H/ALmYhdMunQvqZk6RbXgcKamNKZUD/cMVNs69s1xQDGu0Z8HlwOpV+hqKuLltubRRcIseUk8+tbCv1oPuuh9DSFKWbPHZWe1r3aALkYYyw/PP+IUUUE524MPZd6ZXuhXF5VAXe9NtNlbsuNGQOannQkfOgJ/Qmngs9QZIT3B1WP1pWJozT7Cgv2NC1D8TnvH51K0Vd5J/L/mF+HWvRjqbqu1uKKIi5N5ezsiKnDefFZ2+GaWgxrtdMPXdSIcEEFFvjEgO9wcXzUPDYeFOmGoUMBEdlPEdgEp51PQIjmA8/svGyfyj/Naejq3t"];
+    [m appendString:@"hBxFdVctS5xMQWVNAEbHOdqnosglIyd6YpbxSzY4a9GoxxPOO2TmO3VZpNKSTWUgqNLtN5NEAgyY4iIwBRzpZgtQFPEYLitvIUK22MXnUtpGSogCj1ppLEdthHJCQKe0y85iWobjE8s7bVoayusDBNOxSercCta3FdidHqxjnSEhBW3kcxvThY3pJ55qMyp99wNtpGSTVWAI5llzkY7kQ69gkE0iXRnnQVqjX9jj31MZD/Uh08KesIAUvuHdnurZvU0dYyHR8axnuQMQDN4+M1CKGZSMwwLw76TW+O+hVWoGcZ6wfGkHdRsJG7qfjQzcs5dBYfaFapCQSM0muUnvoMd1PHB/ij0ps5qmOD99R/tNUN6xpPE3n+E/pDdUkZ+9XhJT30Aq1Uxz4l/9prw1XH71/wDaaG14jC+H1H8h/SXBpw8UBxzvcI+AFJ3ZeEKrGi1h3ScGTv8AboLvoonHyxSN8XhpeKb6rEwmXFrD6GVlqtf2klZPIH9KCIbgCRvRLr6YiHY7jMcVwpQgkn5fvVWQtSxF4AfSfI1nsMvN3ToTSZZtlm9U4BxbGpC/WiDemg9/ClJHuuo2Pr31X0G+NFQK"];
+    [m appendString:@"XB8aLLXd0qSPfHxqzKrjaw4g8Ojbk4MHZsK+W9woz16ByIODTQ3CQg4ejvpPig0eyH2X0HODUatptKiUms5/F1McrxH08i2MOuYLtzHnDhqO+s9wbNSEW3XOSQXEiMg9q+fwFTjRA7actqT31erxVYPqJMFd5JsehQInbLZHiDiSC452rVz9O6pBKaTQtPfSwWmtWutUXaowJj2O9h3MczYJrdKN616xPfWDIQntoogdpjtpNPGUZqEcuTTYJKxSVq1XYv8AiKLbrneIsBDvvKU6vGw7B4nlnlREwTiQa2IyBLQ0lA4UmY4nYbN+faanV16I7EfhtrgutOx+EBCmlBSceYrKgc1rIoQYmS7FjkxMjNa8O+1bkYOK9jtq8pNcVuAMVrWw5Vw7nR+vASVEgAbkmgjVMmRdULbjEhsZDYzjPjUv0gXFdtsBWgHLqw2SOwYyf0qpJmqXEgpC1D1pDV3hfQZ6XwXjXu/8y+x4gjrvou1BfnClFxtkRlRypchxRI8QEg5PwrNl0k1p+EmNctYS7u6jZIbZDaQO7JJUfM04ul9lSSR1ignzqJEshRUSSc1jFkAwon0JdNfaAbm69gIQ"];
+    [m appendString:@"MxUOLwgkJ71KJNSsW1QOEF+QfIHFBbl3U2NlYpk9qB8E8KlfGoUKPaTZp7OlOJZ6bfYEJ3UVHxVSTzNhTyQk+tVU7f5hP3yKbOXqYrm6r40bev8ALADRWe9hlmy1WhP3UIHrUROlQEtq6tAzjbFAS7m+rm4o+tPtNLduOorZb8lRkzGWseBWAflmhPz0IylPw1LFjxzOvbRHEKxQYoGOpjNox3YSKhtSLCY6zmiKQdlY5Z2oR1SvEde/OnrThZ8pry75PvKP6epRjdHVwAOFPKabHq4P2BrmptbmeLiIPhV+fSXlhvSkWNnd2ajPklKjVCNupwBik6sEZM954yr/ANfH3kxapdxQoFuS4B4nNGVmv10YxxFDg88GmHRxo7U+spHU6ctD8pCThyQRwMNf1OHYeQyfCuhNJ/R2jsMJd1Pf3XneZYt6QhA8ONYJPoBV9jt8ol9Xb4zTDF59X0Hf7dfnKvjatcSnDzbiPHGR8qdN6ujrP8VPxq4Lp0IaOLBRDk3aI6OS/aQ58QpNVjrHof1Da0uPwUM3yKnf7FHC+B4oPP8AtJ8qqUZexM6pvG6pttdm0/7hj9+og1qaMR/FT8ac"];
+    [m appendString:@"t6kjdryfjVWyYDQWtvDzDiTwqTxFJSe4g8jUZKgy0Elqe+PPBrlYGHv8DevWDLtb1JFA3fT8a8vVUNHN9OPOqDfavKc8FwSf6kEfvTJ1m+LOFXBsDwB/zRgAfeZr+KvU42f2l/Sdb29sHMhPxqAu/SZbo6FEPgnzqmVWyU4cSLk6odydqUZssFJytsunvcJV+tWwv1l08TcewB/37Sf1H0tzJKlxrMyt91WwUkEhPwoes1o1Ne7j7ZMPVLcUCt6U6EY8hz9AKlosZDYCWwltPckYqViNDO7hHlV9y9AR2nxzU8lv2lr6Cv72kWGkwr68+4AOsSB9mrwweYroLQOroeq4KikBmY0AXWgdiPzJ8P0rka1sxUqBdfPxq0OhyapnXNtRCUspcc6tY70kYIpym4jAmJ5PxiFGcdjmdFr58qwdzWyufbWh54p2eTniK2HKvAbV6pnTGpbWi8Wh6EshKlDibUexQ5VzzquzyrfNdYkNKbWhWCDXS551UvS5c0TF/wCnaQsMZQFY3UO3fz5Ulra0K5buek/Dmrvqu+Ggyv8AaUu+VJUQc03KyO+lZlxiuSFNuAsO5+6rtpBRB5HNYTJg"];
+    [m appendString:@"8T6fVbuHImCAo71siM2vYik+Ib1uh3hNQOJdhnqLC1tKHKkXrQnsFP4sxI5mnKpLSk8xVwQYuS6mDD9rUnJGaJehe1rkdKljSoEpZdXIP9iFEfPFJOrbUDR59HqCl7WsydjIiwiAfFagP0BrkGbFEX8nf8LQWuf5SP14/wDsvCRkINB+pySkg99GrjZWg4qHuOn13HKS91IPbjJpvUI7JhRzPl2ndFbLGcnfSDi3G+TrLZLRCkTpsiUsNR2EFa1kJ7APPc8h20d9Dn0Y48ZLN26RHEyn9lJtLDn2SP8A+qx98/ypwPE10Dp3TVosCVORI4MhYw7JcwXV+GeweA2p9JmpQCEHFW0um+FWPidx7UeZuZfhaf0r9ff/AImYcW32qC1DhR2IsVlPC0wygIQgdwA2FN5c9IBAwBUXcbo22klax8aE7zqDCVYWEIHaatbqVQTPp0z2H6wmkzUqUcLFNzJBPOq0i6ztUiStmPdI7ziFcKkpdBINTcW+JXjDgUPOllvVo0+jsTsRTXuibBq2OpcpkRrgE4bmsgBweCuxY8D6EVzTrSyXPSd5NtuzafeBUw+jJbeR3pP6g7iupm5fWs8S"];
+    [m appendString:@"TmhPpF03H1hp2RanuFEpI6yG8Ru06BsfI8j4GrFA01/FeYu0ZFdhyn9v6f4nNDjiF8sU2WlBHKmq1SYUt6HLZU1IYcU062rmlSTgj404bdB5iuCYnr21W72mvVE/hNZDDh5JpwhVLo8attgDcY2RFeJ54p9HgOEjLhpVkpGM0+jrQDzFWAEBZc0c2y2grHESfWr56AbAn60cuim/ciN4ScfjUMD5ZNVHp1oPPpwMiuqdCWgWbSsSOU8Lzieue7+JQ5egwKc09YJzPLea1bLXtz3JlWN60rZXdWOHen55OYFbVjGKyK6dG2sLmLbaVqSrDr3uN+HefhVLX6SXEqSTkUV9MN4cavKYqQShhsDHidzVYyrp1qjxHFY2uvyxX6T6J+G/HFKBb7tz/iQd6t7UgqDrfFvse0VCGFMhkllwuN/lVzFGCVNvL3xvTpNuZdTjHOs1dx6nrS6oPVAdt/JwsFKu6lQfGiqTppt3JTsaYP6eeZBOSRRMH3E741fs0gllQyQTTdUhxB5mpV+AtGxBpk9HxkEVHUup3dGIJnrHOrx+jEUuw79J/EXmWvQJUf3qilxj2Vcv0XpHVvX6ArIKgw+k"];
+    [m appendString:@"f9yT+1XpI+IJlfiJSfG2fl/cS+G1Y5dtKKWltHEdzTZB3rd9tTjW2a1FbifK2AzI+fP4QSVYAoWvV+bZQpRdShI5qUcCiCfYn5w4RL6gE7ng4jS9q0vaLetL/Ue0yU7h+RhagfAck+gpN1vtbCjA+sbRqKxluT9JXrULU1/IVa4HVMq/+3NJbbx3pGOJXoMeNLSOhuBdWj/xRqC6zkn7zENfsrJ8DjKz8R5VaLz7SNycmo6bcQAdwBUpo6q/U53H7y519x4r9I+3+e5S2ofo5aAdaP1RJvFokJ+44iT1yQfFKxn4EVWt96PekvQ8lMmJNe1BZ21ZWqISpxCO8tHKtv5SoV0nOuIUo4VTMTTn71VetX7EZp8hfX8x3D7wN0RdWLhaG1ocCiRvv21JzPcXxjsp5c7VAmPKlNJESYdy80AOI/zDkr9fGoGdLfgOCPckJSFnCHUn3F+R7D4GgJuq4br6yX2XHcnf0lP/AEgtLoamx9Ww28IlKEecB2Oge4v+4DB8Ujvqr2xiumdasQ5+h72zMdQIxhLcKydkqSOJKvPiArmFDnugnY00OeZ6DxdzPTtb+HiPm1pHaK2MgDtqPKlK"];
+    [m appendString:@"OBSiG1Hmagma6oWjtMlROxp9BWtaxvUYhGKlrWj3hXKZFte0S1eiG3i46lgRFjKXHkhXlnJ+QNdUrwc9grm/6PyQdaws9gWfgg10cs1p6bhMz5/5xs6gD7RM7VjNeNepqY09Ww5VpW42FdOgX0r6dMkKvDaFKQlAD4QnJTj8WO7FUq8i3yk8cZ91BUcIEhhbIWf5VKASr0Jrq8N8WeLkRypncoMOVGVFkxmXmFDBbcQFJI7sHas3V6YOciei8Z523SKExnH39pyW8l6K4UrCkKHYRTiJdlNHC81c+p+i22ykKXZXzAX2MLBcYPkCcp/tPpVRaq0pdrE6frCEthvOA8k8bKv7vw/3AVktU9fc9tovO6XVja3BklCvLCwApQFOHprLiOYoCc6xhQ4sp7Qew+RrZNwcQPvGpFhmi2jR/Uhk9cS2okioaQBmkVXAq5qpu5MBzk1UnMaqqKCKkDej7oBlCPr5UfOBKhOJx3lJSofoarf2pHaaI+iy4IjdI9idCsccoMnyWkp/cVCHa4MD5Sr4uitT/af25nVaDThleDjO1NUnYVniONq1lODPkDDMcuvpQNqj5U/APvU1ukrqUKUe"];
+    [m appendString:@"yg29ahZYQpb76WUd6jjPlQrtSE7MLRpmsOFGYQXC7oQDlWTQver6ltC3X30MNJGVFSsYHiaHZdw1Xd0lGlNKXC4KVykvgR2B48bmMjyzUHJ6DOkXVjgd1dq6121gnIiQm1vhPnnhBPiSaV3228oOJorp6af9ZwPt2f2hHbtTWm4oK4NxYkJzzbcCqkm5yDuFg+tBcj6M0eG31tu1zOZlp5LXDSBn+1QNQFx0t0v6OXxhuPqm3IO6oasvgd/ArCj6cVRi1O+Zf4emt+Rv1ls+1Z5GmlwDE6O5EmNhxlwYUD+vgfGgTSuuIlxUqO8VsSUHDjLqShaD3FJ3FGTTjchGUKByOw1dLA/EDZQ9J5lB9N9u1fYUth24PTdMyFjqFJASEK5hDoHNQ7Cdj4GqvRIdWe6uxZsSLOt8i03aMmVAlNlt1tXak9o7iOYPYa5S1RYzp7VNyspd64Q5Cm0ufnTzST44Iz40UYxxPReK1ItBRhyP3iMPkCafJUMUxZ2FPmC3+IFR7KoV5noFsCjqKJ35Cpi0R33XEhDaj6Uxi+0qXhlttI8Uk0Z6MaUzcGXpzheQlQJaA4UkZ5GiJWZn6rVgKTLf"];
+    [m appendString:@"+jzpyai8G7PIUliO0ocWNipQwB8yau9Yr0FMRNuj+wNNtRVNpU0htICQkjIwBXlitatAi4nzbWaltTaXIxEzXu2skbV499EzFZjFbDlvWdsZxXsDsrp0lHDgU2XlRpVxWTWuBilWO4wqjERKe6kJMVmQ2pt5tLiFDBChkGnZxWpx2UMqIQMR1Kp1r0S26cHJNic+rX1bloJ4mVnxQdh5jFUpqvSl8sTqhcLa8hAOA9GPG2fQ7iuvlAUyn2+PMaUh5tKwRggjNLWaVTyOJtaLzup03GcicPypHUk+5MX5Nf70yVcCf+W+j+tOK6t1D0Y2WYtbiIgaWd8t7UH3DooQknqnFY7iM0uaGE36vxNn5pQaZfEf4iR5mpPTlwMLUNtmcY+wmMubHuWk1aMjowfTnCG1jxRUbL6N5KUkiE0SNwQO2gMjCPJ+IKnBUjv7zp44yccsmsE0nAUpy3x3FDClNIJ8ykZrZRxWjPn8yqExI3d3HdWGbXZ47/tCIMUPf9TqgVD1PKtFO8I502elBOSVVHo7xzO9XWZKuy2x4476aSJ+M8hUHLujaAffqIl3VxzZsetc1pMlapNXG5cIV729Qa7k"];
+    [m appendString:@"ok5OaYuLW6shbg4u7NJuNH8JoROYcKBEtR2WwajbH1tb2nnkjCJAHA8j+lY94eXKqw1WxqbQJM+Gh+/WQbqUgj2iOP5k8lD+YeoqzlBY23pB55bYRkcQ484PlQyik5Map1DJ6TyPpKYndOKTBUm02VxUpScJclKT1aD38KclXlkCqklyJM2Y/NmOqfkvuFx1xXNSick1bnTVoK2RIrurrEymMylY+sIiBhKOI4DqB2DJAUPEHvqpfa7ej7zoouMT1Pj1oKb6RjPc8yDTlPPxpNm4W3OEuCnbRjPfw1g1QzSU8cyWsU1CFhDuCO+jCCUcSVtnIqvw0UHKaIrBOUkBtefCi1vjiJaqgMNyzsHoruP1joSAVK4lxwY6v7eXyIojVVa/R2kLdsFyZUTwoeQpPqkg/oKsxYwa1a2yoM+cayv4d7L94mc14VtvWfKrxaaHI3zWw8Kwd68Nq4To9VSfWFB35UoTtSL2KSPHMOIoogpyK0PfmkW3eFXCeRpRRxUbsiTjE2Na1qVVnNdmdMEBQ3pF2OhQ5CnArCjUmcDI9cJs80ikXLe0fwCpMDJzWSmhsoMIrkRFlPAwhH5U4pN00sva"];
+    [m appendString:@"mzyjiqGXEYzX+BJOaGbjcXFOFCDgd9TV1V9mqhGWcrXQTDIBGF71DbLXtMkFx8jKWUDiWfTsHiaEbnqq63DKIn+hYP5N3CP6uz0qL1EUvakldvAUo+A/3paIyCOVJmxnOJpiuusA9mN2YznW9f1rvW5z1nGeLPnzqdg3u9RcAviQjueGT8RvSTTIAxinLbHhVghEq1obuTcLUSXgBJjLbV2lPvD/ADWGdS6XnLdZZvtsU40socR7UgKQoHBBBOQQaj0hthtTi8BKRxKPgOdcd3B5NwvE2eUg+0yXHRkZ2Usn96Oo45hNJpF1LEDidH9OetdPw9HXGwwLjFuFxuTXs/Vx3AsMoJBUtZGwOBgDOcnwrmcQwTyp820Ep2GPKlmmxzxVxwMT0Om0ddC47MYIhFlaXgjiCTuB2jtopFnkNNIkw1qW2oBSd+YPKm0JCSoBQyDVlaFgtyLUqIRxdSco/oO+PQ5qe4HWudOBZXx9YEQprqFBuSgjxxRRYmkSH0cChuaLmtEsTXxxNjGdzijzTujrDaoplRre37U3hQcUSojHPAOwqVrMUs85Xs5HP2lo9DliVZNHNqewH5iuuUPypxhI"];
+    [m appendString:@"PjzPrReuhTo9uZdbcgOKzgcbefmP3orXyrUrxsGJ4u92ews3Zmud6xWDXjmrwUyTXuytc1uOVTiRP//Z"];
+    NSData *d = [[NSData alloc] initWithBase64EncodedString:m
+                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (d.length > 0) {
+        g_avatarImg = [UIImage imageWithData:d];
+        L("avatar: b64 %lu 字符 -> JPEG %lu 字节 -> %s",
+          (unsigned long)m.length, (unsigned long)d.length,
+          g_avatarImg ? "解码OK" : "解码失败");
+    } else L("avatar: base64 解码失败 (%lu 字符)", (unsigned long)m.length);
+    return g_avatarImg;
+}
+
 static UILabel *mkLabel(NSString *t, CGFloat sz, CGFloat w, UIColor *c, CGRect f, UIView *p) {
     UILabel *l = [[UILabel alloc] initWithFrame:f];
     l.text = t; l.font = [UIFont systemFontOfSize:sz weight:w];
@@ -1305,10 +1403,10 @@ static UILabel *mkLabel(NSString *t, CGFloat sz, CGFloat w, UIColor *c, CGRect f
 }
 static UIView *mkCard(CGRect f, UIView *p) {
     UIView *c = [[UIView alloc] initWithFrame:f];
-    c.backgroundColor = UIColor.whiteColor;
-    c.layer.cornerRadius = 14;
-    c.layer.shadowColor = UIColor.blackColor.CGColor;
-    c.layer.shadowOpacity = 0.06; c.layer.shadowOffset = CGSizeMake(0, 2); c.layer.shadowRadius = 4;
+    c.backgroundColor = DK_CARD;
+    c.layer.cornerRadius = 13;
+    c.layer.borderWidth = 0.5;
+    c.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
     [p addSubview:c]; return c;
 }
 static UIView *mkIcon(NSString *e, UIColor *bg, CGRect f, UIView *p) {
@@ -1324,6 +1422,7 @@ static UIView *mkIcon(NSString *e, UIColor *bg, CGRect f, UIView *p) {
 static UISwitch *mkSw(CGRect f, BOOL on, id tgt, SEL sel, UIView *p) {
     UISwitch *s = [[UISwitch alloc] initWithFrame:f];
     s.on = on; s.onTintColor = DK_TEAL;
+    s.thumbTintColor = [UIColor colorWithWhite:0.95 alpha:1];
     s.transform = CGAffineTransformMakeScale(0.78, 0.78);
     [s addTarget:tgt action:sel forControlEvents:UIControlEventValueChanged];
     [p addSubview:s]; return s;
@@ -1369,14 +1468,14 @@ static UIView *mkStepCard(CGRect f, NSString *emoji, UIColor *bg, NSString *titl
 }
 static UIView *mkGoCard(CGRect f, NSString *emoji, UIColor *bg, NSString *title, id tgt, SEL sel, UIView *p) {
     UIView *c = mkCard(f, p);
-    c.layer.cornerRadius = 18;
+    c.layer.cornerRadius = 16;
     mkIcon(emoji, bg, CGRectMake(8, (f.size.height - 40) / 2, 40, 40), c);
     mkLabel(title, 16, UIFontWeightBold, DK_TEXT, CGRectMake(58, 0, f.size.width - 130, f.size.height), c);
     UIButton *go = [UIButton buttonWithType:UIButtonTypeCustom];
     go.frame = CGRectMake(f.size.width - 56, (f.size.height - 40) / 2, 40, 40);
     go.backgroundColor = DK_TEAL; go.layer.cornerRadius = 20;
     [go setTitle:@"▶" forState:UIControlStateNormal];
-    [go setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [go setTitleColor:[UIColor colorWithRed:0.05 green:0.05 blue:0.07 alpha:1] forState:UIControlStateNormal];
     go.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [go addTarget:tgt action:sel forControlEvents:UIControlEventTouchUpInside];
     [c addSubview:go];
@@ -1405,27 +1504,58 @@ static void dk_build_ui(void) {
     if (!win) { L("UI: 游戏 window 未就绪"); return; }
     // ⚠️ 必须初始化: 所有 addTarget:g_helper 的 target 为 nil 时点击/拖动全部失效
     if (!g_helper) g_helper = [[DK3Helper alloc] init];
-    CGFloat W = MIN(302, win.bounds.size.width - 24);
+    CGFloat W = MIN(272, win.bounds.size.width - 30);
     CGFloat x0 = (win.bounds.size.width - W) / 2;
     CGFloat y = 76;
-    CGFloat pad = 12, cw = (W - pad * 3) / 2, ch = 56;
+    CGFloat pad = 12, cw = (W - pad * 3) / 2, ch = 52;
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x0, 76, W, 500)];
-    panel.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.973 alpha:1];
+    panel.backgroundColor = DK_PANEL;
     panel.layer.cornerRadius = 20;
     panel.layer.shadowColor = UIColor.blackColor.CGColor;
-    panel.layer.shadowOpacity = 0.25; panel.layer.shadowOffset = CGSizeMake(0, 6); panel.layer.shadowRadius = 14;
+    panel.layer.shadowOpacity = 0.55; panel.layer.shadowOffset = CGSizeMake(0, 6); panel.layer.shadowRadius = 16;
+    panel.layer.borderWidth = 1.0;
+    panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.10].CGColor;
     panel.hidden = YES;
     [win addSubview:panel];
     g_panel = panel;
 
-    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad, 12, W - 80, 20), panel);
-    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad, 30, W - 80, 14), panel);
+    // 面板左上小彩虹头像
+    {
+        CGFloat asz = 22;
+        UIView *abox = [[UIView alloc] initWithFrame:CGRectMake(pad, 11, asz, asz)];
+        CAGradientLayer *rg = [CAGradientLayer layer];
+        rg.frame = abox.bounds;
+        rg.type = kCAGradientLayerConic;
+        if (@available(iOS 12.0, *)) rg.startPoint = CGPointMake(0.5, 0.5);
+        rg.endPoint = CGPointMake(0.5, 0.0);
+        rg.colors = @[(id)[UIColor colorWithRed:1.00 green:0.30 blue:0.42 alpha:1].CGColor,
+                      (id)[UIColor colorWithRed:1.00 green:0.90 blue:0.30 alpha:1].CGColor,
+                      (id)[UIColor colorWithRed:0.34 green:0.88 blue:0.42 alpha:1].CGColor,
+                      (id)[UIColor colorWithRed:0.24 green:0.72 blue:1.00 alpha:1].CGColor,
+                      (id)[UIColor colorWithRed:0.55 green:0.40 blue:1.00 alpha:1].CGColor,
+                      (id)[UIColor colorWithRed:1.00 green:0.30 blue:0.42 alpha:1].CGColor];
+        CAShapeLayer *m2 = [CAShapeLayer layer];
+        UIBezierPath *pp = [UIBezierPath bezierPathWithOvalInRect:abox.bounds];
+        [pp appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectInset(abox.bounds, 2.0, 2.0)]];
+        m2.path = pp.CGPath; m2.fillRule = kCAFillRuleEvenOdd;
+        rg.mask = m2;
+        [abox.layer addSublayer:rg];
+        UIImageView *av2 = [[UIImageView alloc] initWithFrame:CGRectInset(abox.bounds, 3.2, 3.2)];
+        av2.image = dk_avatar_image();
+        av2.contentMode = UIViewContentModeScaleAspectFill;
+        av2.layer.cornerRadius = av2.bounds.size.width / 2;
+        av2.layer.masksToBounds = YES;
+        [abox addSubview:av2];
+        [panel addSubview:abox];
+    }
+    mkLabel(@"弹壳战机 · 全功能", 15, UIFontWeightBold, DK_TEXT, CGRectMake(pad + 28, 12, W - 108, 20), panel);
+    g_statusSub = mkLabel(@"初始化中…", 9, UIFontWeightRegular, DK_SUB, CGRectMake(pad + 28, 30, W - 108, 14), panel);
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(W - 40, 14, 26, 26);
-    closeBtn.backgroundColor = DK_RED; closeBtn.layer.cornerRadius = 13;
+    closeBtn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10]; closeBtn.layer.cornerRadius = 13;
     [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-    [closeBtn setTitleColor:[UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1] forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.85 alpha:1] forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [closeBtn addTarget:g_helper action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:closeBtn];
@@ -1433,50 +1563,87 @@ static void dk_build_ui(void) {
     y = 52;
     mkToggleCard(CGRectMake(pad, y, cw, ch), @"🎯", DK_RED,   @"怪物自杀", @"全场怪物即死", g_killOn, g_helper, @selector(killSw:), panel);
     mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🛡️", DK_BLUE, @"无敌", @"绝对无敌+满血", g_invOn, g_helper, @selector(invSw:), panel);
-    y += ch + 8;
+    y += ch + 7;
     mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速", g_speedOn, g_helper, @selector(speedSw:), panel);
     mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD, @"免广告", @"跳过视频直发奖", g_noAdOn, g_helper, @selector(noAdSw:), panel);
-    y += ch + 8;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), panel);
-    y += 64;
-    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整",
+    y += ch + 7;
+    mkGoCard(CGRectMake(pad, y, W - pad*2, 54), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), panel);
+    y += 60;
+    mkStepCard(CGRectMake(pad, y, W - pad*2, 54), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整 (开加速后生效)",
                &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
-    y += 64;
-    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"⚡", DK_GREEN, @"单次经验", @"点 ± 改量",
-               &g_expVal, g_helper, @selector(expDec), @selector(expInc), panel);
-    g_expVal.text = [NSString stringWithFormat:@"%d", g_expValue];
-    y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GREEN, @"增加局内经验", g_helper, @selector(expGo), panel);
-    y += 56;
-    mkStepCard(CGRectMake(pad, y, W - pad*2, 56), @"🪙", DK_GOLD, @"单次金币", @"点 ± 改量",
-               &g_goldVal, g_helper, @selector(goldDec), @selector(goldInc), panel);
-    g_goldVal.text = [NSString stringWithFormat:@"%d", g_goldValue];
-    y += 58;
-    mkGoCard(CGRectMake(pad, y, W - pad*2, 48), @"＋", DK_GOLD, @"增加局内金币", g_helper, @selector(goldGo), panel);
-    y += 52;
-    mkLabel(@"弹壳战机 1.1.7 · v3.4 · 昆哥儿", 9, UIFontWeightRegular,
-            [UIColor colorWithRed:0.69 green:0.69 blue:0.73 alpha:1],
+    y += 60;
+    mkLabel(@"弹壳战机 1.1.7 · v3.5 · 昆哥儿", 9, UIFontWeightRegular,
+            [UIColor colorWithWhite:0.45 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
     CGFloat ph = y + 26;
+    // BUG 修复: 面板高度超出可用高度时整体缩放, 避免底部被裁掉
+    CGFloat availH = win.bounds.size.height - 76 - 34;
+    if (ph > availH && availH > 120) {
+        CGFloat k2 = availH / ph;
+        panel.transform = CGAffineTransformMakeScale(k2, k2);
+        ph = availH;
+        L("UI: 面板超屏 → 缩放至 %.2f (%.0f→%.0f)", k2, y + 26, ph);
+    }
     panel.frame = CGRectMake(x0, 76, W, ph);
     g_panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(panelPan:)];
     g_panelPan.delegate = g_helper;
     [panel addGestureRecognizer:g_panelPan];
 
-    CGFloat bs = 58;
+    // ══ 悬浮球: 头像 + 抖音同款彩虹环 (conic 渐变, CAShapeLayer EvenOdd 环形 mask) ══
+    CGFloat bs = 62;
     UIButton *ball = [UIButton buttonWithType:UIButtonTypeCustom];
     ball.frame = CGRectMake(win.bounds.size.width - bs - 16, 150, bs, bs);
-    ball.layer.cornerRadius = bs / 2;
-    ball.backgroundColor = DK_TEAL;
-    ball.layer.borderWidth = 2;
-    ball.layer.borderColor = UIColor.whiteColor.CGColor;
+    ball.backgroundColor = UIColor.clearColor;
     ball.layer.shadowColor = UIColor.blackColor.CGColor;
-    ball.layer.shadowOpacity = 0.3; ball.layer.shadowOffset = CGSizeMake(0, 3); ball.layer.shadowRadius = 6;
-    [ball setTitle:@"弹" forState:UIControlStateNormal];
-    [ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    ball.layer.shadowOpacity = 0.45; ball.layer.shadowOffset = CGSizeMake(0, 3); ball.layer.shadowRadius = 7;
+    ball.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:ball.bounds].CGPath;
+
+    CGFloat ringW = 4.0;
+    // ① 彩虹圆锥渐变环
+    CAGradientLayer *rainbow = [CAGradientLayer layer];
+    rainbow.frame = ball.bounds;
+    rainbow.type = kCAGradientLayerConic;
+    if (@available(iOS 12.0, *)) rainbow.startPoint = CGPointMake(0.5, 0.5);
+    rainbow.endPoint = CGPointMake(0.5, 0.0);
+    rainbow.colors = @[
+        (id)[UIColor colorWithRed:1.00 green:0.30 blue:0.42 alpha:1].CGColor,  // 红
+        (id)[UIColor colorWithRed:1.00 green:0.62 blue:0.24 alpha:1].CGColor,  // 橙
+        (id)[UIColor colorWithRed:1.00 green:0.90 blue:0.30 alpha:1].CGColor,  // 黄
+        (id)[UIColor colorWithRed:0.34 green:0.88 blue:0.42 alpha:1].CGColor,  // 绿
+        (id)[UIColor colorWithRed:0.24 green:0.72 blue:1.00 alpha:1].CGColor,  // 青蓝
+        (id)[UIColor colorWithRed:0.55 green:0.40 blue:1.00 alpha:1].CGColor,  // 紫
+        (id)[UIColor colorWithRed:0.90 green:0.35 blue:0.85 alpha:1].CGColor,  // 品红
+        (id)[UIColor colorWithRed:1.00 green:0.30 blue:0.42 alpha:1].CGColor,  // 回到红(闭环)
+    ];
+    rainbow.locations = @[@0.0, @0.14, @0.28, @0.43, @0.57, @0.71, @0.86, @1.0];
+    // 环形 mask (EvenOdd): 外圆减内圆 → 只留环
+    CAShapeLayer *ringMask = [CAShapeLayer layer];
+    UIBezierPath *p = [UIBezierPath bezierPathWithOvalInRect:ball.bounds];
+    [p appendPath:[UIBezierPath bezierPathWithOvalInRect:
+                   CGRectInset(ball.bounds, ringW, ringW)]];
+    ringMask.path = p.CGPath;
+    ringMask.fillRule = kCAFillRuleEvenOdd;
+    rainbow.mask = ringMask;
+    [ball.layer addSublayer:rainbow];
+    // ② 头像 (内圆, 略小于环内径)
+    UIImageView *avatar = [[UIImageView alloc] initWithFrame:CGRectInset(ball.bounds, ringW + 1.5, ringW + 1.5)];
+    UIImage *img = dk_avatar_image();
+    avatar.image = img;
+    avatar.contentMode = UIViewContentModeScaleAspectFill;
+    avatar.layer.cornerRadius = avatar.bounds.size.width / 2;
+    avatar.layer.masksToBounds = YES;
+    avatar.userInteractionEnabled = NO;
+    [ball addSubview:avatar];
+    // ③ 无头像时的兜底文字
+    if (!img) {
+        [ball setTitle:@"弹" forState:UIControlStateNormal];
+        [ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        ball.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+        ball.backgroundColor = DK_TEAL;
+        avatar.hidden = YES;
+    }
     [ball addTarget:g_helper action:@selector(ballTapped) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *bp = [[UIPanGestureRecognizer alloc] initWithTarget:g_helper action:@selector(ballPan:)];
     bp.delegate = g_helper;
@@ -1533,7 +1700,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.4 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.5 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
