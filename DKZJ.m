@@ -560,12 +560,15 @@ static void resolve_step(void) {
         case RS_M2c:
             if (k_Char) {
                 m_Char_AddAbsInv    = mof(k_Char, "AddAbsoluteInvincibility", 0);
+                m_Char_RemoveAbsInv = mof(k_Char, "RemoveAbsoluteInvincibility", 0);   // ★ v3.7 补: 原先漏解析
                 m_Char_AddStatus    = mof(k_Char, "AddCharacterStatus", 1);
+                m_Char_RemoveStatus = mof(k_Char, "RemoveCharacterStatus", 1);          // ★ v3.7 补: 原先漏解析
                 m_Char_getCurrentHp = mof(k_Char, "get_CurrentHp", 0);
                 m_Char_setCurrentHp = mof(k_Char, "set_CurrentHp", 1);
             }
-            L("A[M2c] absInv=%p status=%p curHp=%p/%p",
-              m_Char_AddAbsInv, m_Char_AddStatus, m_Char_getCurrentHp, m_Char_setCurrentHp);
+            L("A[M2c] absInv=%p/%p status=%p/%p curHp=%p/%p",
+              m_Char_AddAbsInv, m_Char_RemoveAbsInv, m_Char_AddStatus, m_Char_RemoveStatus,
+              m_Char_getCurrentHp, m_Char_setCurrentHp);
             g_rs = RS_M3; break;
         case RS_M3:
             if (k_BattleMgr) {
@@ -1023,7 +1026,11 @@ static void do_invincible(void) {
         void *h = heroes[i];
         if (!h) continue;
         // ① 清理历史误加的物理检测免疫状态 (影响宝箱拾取)
-        if (!g_invCleaned) inv_cleanup_bad_status(h);
+        //    ⚠️ 只在首次执行; 若 RemoveCharacterStatus 指针缺失则跳过 (避免假日志)
+        if (!g_invCleaned) {
+            if (m_Char_RemoveStatus) inv_cleanup_bad_status(h);
+            else if (h) L("② inv: ⚠️ RemoveCharacterStatus 未解析, 无法清理状态位 (本次不动状态)");
+        }
         // ② 引擎自带绝对无敌 (不改物理层, 不干扰宝箱)
         if (m_Char_AddAbsInv) ic_call(m_Char_AddAbsInv, h, NULL);
         // ③ 血量维持
@@ -1613,7 +1620,7 @@ static void dk_build_ui(void) {
                &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 60;
-    mkLabel(@"弹壳战机 1.1.7 · v3.6 · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.7 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithWhite:0.45 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -1740,7 +1747,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.6 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.7 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
