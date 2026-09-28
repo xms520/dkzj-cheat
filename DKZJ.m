@@ -371,6 +371,7 @@ static void *m_CTX_GMSetCurMissionId;   // ctx.GMSetCurMissionId(missionId)
 static void *m_CTX_AddExpAndGold;       // ctx.AddExpAndGold()
 static void *m_CTX_OnWaveEnd;           // ctx.OnWaveEnd()
 static int32_t g_myPlayerId = -1;       // WorldBattle.MyPlayerId (字段直读)
+static BOOL    g_invCleaned = NO;       // 已清理历史误加状态位 (ImmuneSelect/PhysicalDetection)
 static void *m_Ad_Show0;
 static Il2CppClass *k_Ad_Fallback = NULL, *k_Ad_Player = NULL;
 static void *m_Ad_Fb_IsReady, *m_Ad_Fb_Show4, *m_Ad_Fb_Show0;
@@ -976,6 +977,23 @@ static void do_kill(void) {
 }
 
 // ───────────────────── 功能 ② 无敌 ─────────────────────
+// ⚠️ v3.6 修复「本体在宝箱上识别不到」:
+//   CharacterStatusType 是【位标志】, 真实值经两个独立枚举(HitCamp/Camp)交叉标定为:
+//     None=0, ImmuneSelect=1, ImmuneDamage=2, ImmuneControl=4, ImmuneDeBuff=8, ImmunePhysicalDetection=16
+//   v3.5 误加 17 = ImmuneSelect(1) | ImmunePhysicalDetection(16)
+//     → 物理检测免疫 → 宝箱/掉落物/碰撞体全部识别不到 ✓ 与用户反馈完全吻合
+//   现改为: 只维持血量 + AddAbsoluteInvincibility(引擎自带无敌语义, 不改物理层), 不再乱加 status。
+//   并主动清理历史误加的 1 / 16 / 17 状态。
+static void inv_cleanup_bad_status(void *hero) {
+    if (!hero || !m_Char_RemoveStatus) return;
+    const int32_t bad[] = { 1, 16, 17 };   // ImmuneSelect / ImmunePhysicalDetection / 组合
+    for (int i = 0; i < 3; i++) {
+        int32_t v = bad[i];
+        void *a[1] = { &v };
+        ic_call(m_Char_RemoveStatus, hero, a);
+    }
+}
+
 static void do_invincible(void) {
     void *ctx = get_ctx();
     if (!ctx) return;
@@ -1004,23 +1022,43 @@ static void do_invincible(void) {
     for (int i = 0; i < hn; i++) {
         void *h = heroes[i];
         if (!h) continue;
+        // ① 清理历史误加的物理检测免疫状态 (影响宝箱拾取)
+        if (!g_invCleaned) inv_cleanup_bad_status(h);
+        // ② 引擎自带绝对无敌 (不改物理层, 不干扰宝箱)
         if (m_Char_AddAbsInv) ic_call(m_Char_AddAbsInv, h, NULL);
+        // ③ 血量维持
         void *setHp = m_Char_setCurrentHp;
         if (!setHp) setHp = vmi(h, "set_CurrentHp", 1);
         if (setHp) {
             int64_t big = 999999999LL;
-            void *args[1] = { &big };
-            ic_call(setHp, h, args);
-        }
-        if (m_Char_AddStatus) {
-            int32_t st = 2;   // 【推测】CharacterStatusType.ImmuneDamage (枚举序 None,ImmuneSelect,ImmuneDamage,...)
-            void *args[1] = { &st };
-            ic_call(m_Char_AddStatus, h, args);
+            void *a[1] = { &big };
+            ic_call(setHp, h, a);
         }
     }
+    if (hn > 0) g_invCleaned = YES;
     static int il = 0;
     if (++il <= 3 || il % 60 == 0)
-        L("② inv: 英雄%d abs=%p setHp=%p status=%p", hn, m_Char_AddAbsInv, m_Char_setCurrentHp, m_Char_AddStatus);
+        L("② inv: 英雄%d absInv=%p setHp=%p 已清误加状态=%d (不干扰宝箱拾取)",
+          hn, m_Char_AddAbsInv, m_Char_setCurrentHp, g_invCleaned);
+}
+
+// 关闭无敌: 解除绝对无敌 + 恢复血量 (恢复物理检测不受影响)
+static void inv_off(void) {
+    void *ctx = get_ctx();
+    if (!ctx) return;
+    void *em = ctx_entity(ctx);
+    if (!em || !m_EM_GetAllPlayer) return;
+    void *parr = ic_call(m_EM_GetAllPlayer, em, NULL);
+    if (!parr) return;
+    int32_t pn = arr_len(parr); if (pn > 4) pn = 4;
+    for (int i = 0; i < pn; i++) {
+        void *h = arr_at(parr, i);
+        if (!h) continue;
+        if (m_Char_RemoveAbsInv) ic_call(m_Char_RemoveAbsInv, h, NULL);
+        inv_cleanup_bad_status(h);
+    }
+    g_invCleaned = NO;
+    L("② inv: 已关闭 — 解除绝对无敌 + 清理状态位");
 }
 
 // ───────────────────── 功能 ③ 一键通关 ─────────────────────
@@ -1251,7 +1289,7 @@ static void combat_tick(void) {
         if (g_noAdOn != adInstalled) { do_no_ad(); adInstalled = g_noAdOn; }
 
         if (g_inBattle) {
-            if (g_killOn  && (g_tickN % 2 == 0)) do_kill();       // 0.8s 一次
+            if (g_killOn  && (g_tickN % 3 == 0)) do_kill();       // 1.2s 一次 (降频防卡顿)
             if (g_invOn   && (g_tickN % 3 == 0)) do_invincible();
             if (g_speedOn && (g_tickN % 3 == 0)) do_speed();
             else if (g_speedWasOn && (g_tickN % 3 == 0)) restore_speed();
@@ -1329,7 +1367,9 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
 }
 - (void)closeTapped { g_panel.hidden = YES; }
 - (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"];  L("①秒杀→%d", sw.on); }
-- (void)invSw:(UISwitch *)sw   { g_invOn   = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];   L("②无敌→%d", sw.on); }
+- (void)invSw:(UISwitch *)sw   { g_invOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];
+                                 if (!sw.on) inv_off();          // 关闭时恢复无敌/清状态位
+                                 L("②无敌→%d", sw.on); }
 - (void)speedSw:(UISwitch *)sw { g_speedOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_spd"];
                                  if (!sw.on) restore_speed(); L("④加速→%d (%.1fx)", sw.on, g_speedMult); }
 - (void)noAdSw:(UISwitch *)sw  { g_noAdOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_noad"];
@@ -1573,7 +1613,7 @@ static void dk_build_ui(void) {
                &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 60;
-    mkLabel(@"弹壳战机 1.1.7 · v3.5 · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.6 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithWhite:0.45 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -1700,7 +1740,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.5 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.6 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
