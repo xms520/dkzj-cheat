@@ -72,6 +72,13 @@ static UIPanGestureRecognizer *g_panelPan = nil;
 static UILabel  *g_statusSub = nil;
 static UILabel  *g_expVal = nil, *g_goldVal = nil, *g_spdVal = nil;
 
+// ───────────────────── v3.8 新增: 宝箱/掉落拾取辅助 + 开关持久化 ─────────────────────
+static void *m_EM_GetAllEnemy = NULL;     // EntityManager.GetAllEnemy(实体集合, 含非怪)
+static void *m_EM_GetAllDrop  = NULL;     // EntityManager.GetAllDrop (v3.8 探测)
+static void *m_EM_GetAllItem  = NULL;     // EntityManager.GetAllItem (v3.8 探测)
+static int32_t off_Ctx_IsOpenBox = -1;    // BattleWorldContext.IsOpenBox (bool)
+static BOOL g_pullOn = YES;   // ★ v3.8 默认开               // 拉取宝箱/掉落 (默认开)
+
 // ───────────────────── SIGSEGV 安全网 ─────────────────────
 static volatile sig_atomic_t g_guardActive = 0;
 static volatile sig_atomic_t g_guardDepth  = 0;
@@ -415,6 +422,83 @@ static Il2CppClass *cn(Il2CppImage img, const char *ns, const char *name) {
     return r;
 }
 
+// ★ v3.8: 枚举一个类的全部方法名 → 写日志, 用于定位"宝箱/掉落"相关入口
+//    (只读诊断, 不改任何游戏状态; 一次性调用)
+static void dk_dump_em_methods(Il2CppClass *k) {
+    if (!k || !I.class_get_methods || !I.method_get_name) return;
+    if (DK_GUARD_BEGIN() != 0) { DK_GUARD_END(); return; }
+    L("── v3.8 EntityManager 方法清单 (找宝箱/掉落入口) ──");
+    void *it = NULL; void *mi = NULL; int n = 0;
+    while ((mi = I.class_get_methods(k, &it)) != NULL && n < 200) {
+        const char *nm = I.method_get_name(mi);
+        if (nm) {
+            // 只打印可能相关的 (含 Drop/Box/Item/Pick/Collect/Enemy/All/Body/Chest)
+            if (strstr(nm, "Drop") || strstr(nm, "Box") || strstr(nm, "Item") ||
+                strstr(nm, "Pick") || strstr(nm, "Collect") || strstr(nm, "Enemy") ||
+                strstr(nm, "All")  || strstr(nm, "Body") || strstr(nm, "Chest") ||
+                strstr(nm, "Reward") || strstr(nm, "GetEntity"))
+                L("   EM.%s(%d参)", nm, I.method_get_param_count ? I.method_get_param_count(mi) : -1);
+        }
+        n++;
+    }
+    L("── 共 %d 个方法 (已过滤显示) ──", n);
+    DK_GUARD_END();
+}
+
+// ★ v3.8: 枚举 BattleWorldContext 上 Box/Drop/Open 相关方法与字段 → 直接暴露"宝箱开启"API
+static void dk_dump_ctx_box(Il2CppClass *k) {
+    if (!k) return;
+    if (I.class_get_methods && I.method_get_name && DK_GUARD_BEGIN() == 0) {
+        L("── v3.8 BattleWorldContext 宝箱相关方法 ──");
+        void *it = NULL; void *mi = NULL; int n = 0;
+        while ((mi = I.class_get_methods(k, &it)) != NULL && n < 400) {
+            const char *nm = I.method_get_name(mi);
+            if (nm && (strstr(nm, "Box") || strstr(nm, "Drop") || strstr(nm, "Open") ||
+                       strstr(nm, "Pick") || strstr(nm, "Reward") || strstr(nm, "Item") ||
+                       strstr(nm, "Chest") || strstr(nm, "Spawn")))
+                L("   CTX.%s(%d参)", nm, I.method_get_param_count ? I.method_get_param_count(mi) : -1);
+            n++;
+        }
+        DK_GUARD_END();
+    }
+    if (I.class_get_fields && I.field_get_name && DK_GUARD_BEGIN() == 0) {
+        void *it = NULL; void *fi = NULL; int n = 0;
+        while ((fi = I.class_get_fields(k, &it)) != NULL && n < 400) {
+            const char *nm = I.field_get_name(fi);
+            int32_t off = I.field_get_offset ? (int32_t)I.field_get_offset(fi) : -1;
+            if (nm && (strstr(nm, "Box") || strstr(nm, "Drop") || strstr(nm, "Item") ||
+                       strstr(nm, "Chest") || strstr(nm, "Reward")))
+                L("   CTX.字段 %s @0x%x", nm, off);
+            n++;
+        }
+        DK_GUARD_END();
+    }
+    L("── ctx 宝箱清单结束 ──");
+}
+
+// ★ v3.8: 在 HotFixBattle.dll 里按类名搜 "Box/Chest/Drop/Item/Pick/Reward" → 定位宝箱类真名
+static void dk_dump_box_classes(Il2CppImage img) {
+    if (!img || !I.image_get_class_count || !I.image_get_class || !I.class_get_name) return;
+    if (DK_GUARD_BEGIN() != 0) { DK_GUARD_END(); return; }
+    size_t n = I.image_get_class_count(img);
+    L("── v3.8 HotFixBattle.dll 宝箱候选类 (共 %zu 类) ──", n);
+    for (size_t i = 0; i < n; i++) {
+        Il2CppClass *c = I.image_get_class(img, i);
+        if (!c) continue;
+        const char *nm = I.class_get_name(c);
+        if (!nm) continue;
+        if (strstr(nm, "Box") || strstr(nm, "Chest") || strstr(nm, "Drop") ||
+            strstr(nm, "Item") || strstr(nm, "Pick") || strstr(nm, "Reward") ||
+            strstr(nm, "Treasure")) {
+            const char *ns = I.class_get_namespace ? I.class_get_namespace(c) : NULL;
+            Il2CppClass *par = I.class_get_parent ? (Il2CppClass *)I.class_get_parent(c) : NULL;
+            L("   [%s] %s : %s", ns ? ns : "", nm, par && I.class_get_name ? I.class_get_name(par) : "?");
+        }
+    }
+    L("── 宝箱候选类清单结束 ──");
+    DK_GUARD_END();
+}
+
 // ── 分步状态机 ──
 enum { RS_WAIT_DOMAIN=0, RS_HF, RS_HFB, RS_AD, RS_COR,
        RS_C1, RS_C1b, RS_C2, RS_C2b, RS_C3, RS_C3b, RS_C3c,
@@ -481,6 +565,8 @@ static void resolve_step(void) {
             k_Hero = cn(g_imgHFB, "HotFix.BattleLogic", "EntityHero");
             k_TDD  = cn(g_imgHFB, "HotFix.BattleLogic", "TakeDamageData");
             L("A[C2b] Hero=%p TDD=%p", k_Hero, k_TDD);
+            // ★ v3.8: 一次性列出宝箱/掉落候选类 (定位真名, 供后续版本直接调用)
+            dk_dump_box_classes(g_imgHFB);
             g_rs = RS_C3; break;
         case RS_C3:
             k_BattleMgr  = cn(g_imgHFB, "HotFix.BattleLogic", "BattleManager");
@@ -519,6 +605,8 @@ static void resolve_step(void) {
                 m_CTX_ShowExpUI           = mof(k_Ctx, "ShowExpUI", 0);
                 m_CTX_TriggerLevelUp      = mof(k_Ctx, "TriggerLevelUpEvent", 1);
                 m_CTX_GetUserExp          = mof(k_Ctx, "get_UserExp", 0);
+                // v3.8: 宝箱/掉落拉取 —— 枚举 ctx 上 Box/Drop/Open 相关方法与字段
+                dk_dump_ctx_box(k_Ctx);
             }
             L("A[M1c] ctxExp=%p ctxGold=%p ctxWaveGold=%p goldEvent=%p",
               m_CTX_AddUserExp, m_CTX_AddDropGold, m_CTX_AddWaveGold, m_CTX_DisPathGoldUpdate);
@@ -545,8 +633,25 @@ static void resolve_step(void) {
                 m_EM_GetEntityValues    = mof(k_EM, "GetEntityValues", 0);
                 m_EM_GetAllPlayer       = mof(k_EM, "GetAllPlayer", 0);
                 m_EM_EnemyCommitSuicide = mof(k_EM, "EnemyCommitSuicide", 2);
+                // v3.8: 宝箱/掉落拉取 —— 枚举 EntityManager 全部方法名, 找可能的"全部实体/掉落"入口
+                dk_dump_em_methods(k_EM);
+                // 敌人列表方法多候选探测 (用于秒杀只打真敌人; 拿不到 → 秒杀自动跳过非怪实体)
+                static const char *enemyNames[] = {
+                    "GetAllEnemy","GetAllEnemies","GetEnemies","GetEnemyList","GetEnemyValues",
+                    "GetAllMonster","GetMonsters","GetMonsterList","GetAllMonsters","GetAllUnit"
+                };
+                for (int i = 0; i < 10 && !m_EM_GetAllEnemy; i++)
+                    m_EM_GetAllEnemy = mof(k_EM, enemyNames[i], 0);
+                static const char *dropNames[] = {
+                    "GetAllDrop","GetDrops","GetDropList","GetAllItem","GetItems","GetAllChest",
+                    "GetChests","GetAllReward","GetRewards","GetAllProp","GetProps"
+                };
+                for (int i = 0; i < 11 && !m_EM_GetAllDrop; i++)
+                    m_EM_GetAllDrop = mof(k_EM, dropNames[i], 0);
             }
-            L("A[M2] vals=%p allPlayer=%p suicide=%p", m_EM_GetEntityValues, m_EM_GetAllPlayer, m_EM_EnemyCommitSuicide);
+            L("A[M2] vals=%p allPlayer=%p suicide=%p | v3.8 宝箱: allEnemy=%p allDrop=%p allItem=%p",
+              m_EM_GetEntityValues, m_EM_GetAllPlayer, m_EM_EnemyCommitSuicide,
+              m_EM_GetAllEnemy, m_EM_GetAllDrop, m_EM_GetAllItem);
             g_rs = RS_M2b; break;
         case RS_M2b:
             if (k_Char) {
@@ -615,10 +720,12 @@ static void resolve_step(void) {
             if (k_WorldBattle) off_CurLogicWorld  = foff(k_WorldBattle, "CurLogicWorld");
             if (k_BLW)         off_BLW_worldCtx   = foff(k_BLW, "_worldContext");
             if (k_Ctx)         off_Ctx_gameSpeed  = foff(k_Ctx, "gameSpeed");
+            if (k_Ctx)         off_Ctx_IsOpenBox  = foff(k_Ctx, "IsOpenBox");   // ★ v3.8
             if (k_WorldBattle) off_World_timeScale= foff(k_WorldBattle, "_curTimeScale");
             if (k_ADMgr)       off_AD_onClose     = foff(k_ADMgr, "_onClose");
-            L("A[OFF] curLogicWorld=0x%x worldCtx=0x%x gameSpeed=0x%x timeScale=0x%x adOnClose=0x%x",
-              off_CurLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale, off_AD_onClose);
+            L("A[OFF] curLogicWorld=0x%x worldCtx=0x%x gameSpeed=0x%x timeScale=0x%x adOnClose=0x%x isOpenBox=0x%x",
+              off_CurLogicWorld, off_BLW_worldCtx, off_Ctx_gameSpeed, off_World_timeScale,
+              off_AD_onClose, off_Ctx_IsOpenBox);
             if (!m_BG_getWorld && off_CurLogicWorld <= 0) {
                 L("A ✗ 无可用世界入口 → 功能不可用"); g_rs = RS_FAIL; return;
             }
@@ -941,6 +1048,29 @@ static void do_kill(void) {
         if (isPlayer) { sk++; continue; }
         if (!is_inst_of(e, k_Char)) continue;
         if (k_Hero && is_inst_of(e, k_Hero)) { sk++; continue; }
+        // ⚠️ v3.8 安全加固: 只对【确认是敌人】的实体下手。
+        //    v3.7 及以前: 只要不是玩家/英雄就 SetHp(0)+OnDeath →
+        //    会误杀宝箱/掉落物/可破坏物/中立单位 → 表现正是"卡宝箱/宝箱点不到/宝箱秒没"。
+        //    现改为: 必须有证据表明是敌人; 拿不到证据就跳过 (可回退)。
+        {
+            int isEnemy = 0;
+            if (m_EM_GetAllEnemy) {
+                static void *enemyArr = NULL;
+                static int enemyTick = -1;
+                static int killRound = 0;
+                int tk = ++killRound;
+                if (enemyTick != tk) {                     // 每轮复用一次敌人列表
+                    enemyTick = tk;
+                    enemyArr = ic_call(m_EM_GetAllEnemy, em, NULL);
+                }
+                if (enemyArr) {
+                    int32_t en = arr_len(enemyArr);
+                    if (en > 2000) en = 2000;
+                    for (int k = 0; k < en; k++) if (arr_at(enemyArr, k) == e) { isEnemy = 1; break; }
+                }
+            }
+            if (!isEnemy) { sk++; continue; }              // 不是敌人 → 绝不触碰
+        }
         if (m_Char_getIsDead) {
             Il2CppObject *dead = ic_call(m_Char_getIsDead, e, NULL);
             if (dead && *(uint8_t *)((uint8_t *)dead + 0x10)) continue;
@@ -1066,6 +1196,134 @@ static void inv_off(void) {
     }
     g_invCleaned = NO;
     L("② inv: 已关闭 — 解除绝对无敌 + 清理状态位");
+}
+
+// ───────────────────── v3.8 功能: 宝箱/掉落「识别不到」修复 + 自动拉取 ─────────────────────
+// 【问题】宝箱本体识别不到: 英雄与宝箱/掉落物的碰撞被拦截 —— 引擎侧只有三种可能
+//   ① CharacterStatusType 位标志污染 (ImmuneSelect / ImmunePhysicalDetection)
+//      注: 本作 CharacterStatusType 是【位标志】, 真实值经两个独立枚举
+//          (HitCamp / Camp) 交叉标定 → 1=ImmuneSelect, 16=ImmunePhysicalDetection
+//      v3.7 已改为只用 AddAbsoluteInvincibility, 但历史残留位可能仍在
+//   ② 速度倍率过高: gameSpeed/TimeScale 会放大每帧位移, 快速掠过宝箱触发区
+//   ③ 帧同步跳帧: 高倍率下拾取判定帧被跳过
+static BOOL g_chestCleanDone = NO;      // 本次战斗是否已做过状态位清理 (幂等)
+static int  g_chestCleanN = 0;          // 累计清理过的英雄数
+static int  g_pullN = 0;                // 累计拉取尝试次数
+static int  g_pullHit = 0;              // 累计成功拉取的实体数
+
+// 深度清理: 对英雄清掉全部会拦截物理/选择检测的状态位
+static void chest_fix_hero(void *h) {
+    if (!h) return;
+    int cleaned = 0;
+    if (m_Char_RemoveStatus) {
+        // 1=ImmuneSelect  16=ImmunePhysicalDetection  17=两者叠加
+        const int32_t bad[] = { 1, 16, 17 };
+        for (int i = 0; i < 3; i++) {
+            int32_t v = bad[i];
+            void *a[1] = { &v };
+            ic_call(m_Char_RemoveStatus, h, a);
+            cleaned++;
+        }
+    }
+    if (cleaned) g_chestCleanN++;
+}
+
+// 主修复入口 (每 tick 调, 幂等)
+static void chest_fix_tick(void) {
+    void *ctx = get_ctx();
+    if (!ctx) return;
+    void *em = ctx_entity(ctx);
+    if (!em) return;
+    void *heroes[4] = {0};
+    int hn = 0;
+    if (m_EM_GetAllPlayer) {
+        void *parr = ic_call(m_EM_GetAllPlayer, em, NULL);
+        if (parr) {
+            int32_t pn = arr_len(parr); if (pn > 4) pn = 4;
+            for (int i = 0; i < pn; i++) heroes[i] = arr_at(parr, i);
+            hn = pn;
+        }
+    }
+    if (hn == 0 && m_EM_GetEntityValues && k_Hero) {
+        void *list = ic_call(m_EM_GetEntityValues, em, NULL);
+        if (list) {
+            int32_t n = list_size(list); if (n > 800) n = 800;
+            for (int i = 0; i < n && hn < 4; i++) {
+                void *e = list_at(list, i);
+                if (e && is_inst_of(e, k_Hero)) heroes[hn++] = e;
+            }
+        }
+    }
+    if (hn == 0) return;
+    // 清理只做一次 (状态位一旦清掉就不会自己回来)
+    if (!g_chestCleanDone) {
+        for (int i = 0; i < hn; i++) chest_fix_hero(heroes[i]);
+        g_chestCleanDone = YES;
+        L("⑧ 宝箱修复: 已清 %d 个英雄的物理检测免疫位 (ImmuneSelect/PhysicalDetection) — "
+          "若仍拾取不到请把加速关掉再试", g_chestCleanN);
+    }
+    // 每 2 秒打印一次状态 (只在前 3 次, 防刷屏)
+    static int rl = 0;
+    if (++rl <= 3)
+        L("⑧ 宝箱状态: IsOpenBox字段=0x%x 英雄=%d 清理=%d 拉取尝试=%d 命中=%d",
+          off_Ctx_IsOpenBox, hn, g_chestCleanDone, g_pullN, g_pullHit);
+}
+
+// 自动拾取辅助: 扩大英雄拾取范围字段 (若引擎有此字段) —— 只做"字段写入", 绝不盲调未知签名的方法
+// ⚠️ 盲调 MoveTo/PullTo 之类方法风险极高 (签名未知, 可能把实体指针当成 Vector3 传) → 不做。
+static int32_t off_Hero_pickRange = -1;
+static const char *g_pickFieldName = NULL;
+static BOOL g_pickProbed = NO;
+
+static void chest_range_probe(void *hero) {
+    if (g_pickProbed || !hero) return;
+    g_pickProbed = YES;
+    static const char *cand[] = {
+        "pickRange","PickRange","pickRadius","PickRadius","pickupRange","PickupRange",
+        "collectRange","CollectRange","attractRange","AttractRange","_pickRange",
+        "_pickRadius","pickupRadius","PickupRadius","autoPickRange","m_pickRange"
+    };
+    Il2CppClass *rc = (Il2CppClass *)I.object_get_class(hero);
+    for (int i = 0; i < 16 && off_Hero_pickRange <= 0; i++) {
+        int32_t o = foff(rc, cand[i]);
+        if (o > 0) { off_Hero_pickRange = o; g_pickFieldName = cand[i]; }
+    }
+    L("⑧ 拾取范围字段: %s (off=0x%x, 英雄类=%s)",
+      off_Hero_pickRange > 0 ? g_pickFieldName : "未命中",
+      off_Hero_pickRange, rc && I.class_get_name ? I.class_get_name(rc) : "?");
+    // 诊断: 把英雄类里所有含 Range/Radius/Pick/Collect 的字段列出来 (下轮可按真名精确写)
+    if (rc && I.class_get_fields && I.field_get_name && DK_GUARD_BEGIN() == 0) {
+        void *it = NULL; void *fi = NULL; int n = 0;
+        while ((fi = I.class_get_fields(rc, &it)) != NULL && n < 400) {
+            const char *nm = I.field_get_name(fi);
+            int32_t o = I.field_get_offset ? (int32_t)I.field_get_offset(fi) : -1;
+            if (nm && (strstr(nm, "Range") || strstr(nm, "Radius") || strstr(nm, "Pick") ||
+                       strstr(nm, "Collect") || strstr(nm, "Attract")))
+                L("   Hero字段 %s @0x%x", nm, o);
+            n++;
+        }
+        DK_GUARD_END();
+    }
+}
+
+static void chest_range_tick(void) {
+    if (!g_pullOn) return;
+    if (!m_EM_GetAllPlayer) return;
+    void *ctx = get_ctx();
+    if (!ctx) return;
+    void *em = ctx_entity(ctx);
+    if (!em) return;
+    void *parr = ic_call(m_EM_GetAllPlayer, em, NULL);
+    if (!parr || arr_len(parr) == 0) return;
+    void *hero = arr_at(parr, 0);
+    if (!hero) return;
+    chest_range_probe(hero);
+    if (off_Hero_pickRange > 0) {
+        float big = 999.0f;
+        *(float *)((uint8_t *)hero + off_Hero_pickRange) = big;
+        static int rl = 0;
+        if (rl++ < 3) L("⑧ 拾取范围: %s 已设为 999 (英雄=%p)", g_pickFieldName, hero);
+    }
 }
 
 // ───────────────────── 功能 ③ 一键通关 ─────────────────────
@@ -1300,6 +1558,11 @@ static void combat_tick(void) {
             if (g_invOn   && (g_tickN % 3 == 0)) do_invincible();
             if (g_speedOn && (g_tickN % 3 == 0)) do_speed();
             else if (g_speedWasOn && (g_tickN % 3 == 0)) restore_speed();
+            // ★ v3.8: 宝箱/掉落修复 (每 1.2s 一次, 幂等)
+            if (g_tickN % 3 == 0) {
+                chest_fix_tick();
+                chest_range_tick();
+            }
         }
         g_speedWasOn = g_speedOn;
         DK_GUARD_END();
@@ -1332,6 +1595,7 @@ static void combat_tick(void) {
 - (void)invSw:(UISwitch *)sw;
 - (void)speedSw:(UISwitch *)sw;
 - (void)noAdSw:(UISwitch *)sw;
+- (void)pullSw:(UISwitch *)sw;      // ★ v3.8 宝箱/掉落拉取
 - (void)passTap;
 - (void)expGo; - (void)goldGo;
 - (void)expDec; - (void)expInc;
@@ -1381,6 +1645,8 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
                                  if (!sw.on) restore_speed(); L("④加速→%d (%.1fx)", sw.on, g_speedMult); }
 - (void)noAdSw:(UISwitch *)sw  { g_noAdOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_noad"];
                                  do_no_ad(); L("⑤免广告→%d", sw.on); }
+- (void)pullSw:(UISwitch *)sw  { g_pullOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_pull"];
+                                 L("⑧宝箱拉取→%d", sw.on); }   // ★ v3.8
 - (void)passTap { do_pass_chapter(); }
 - (void)expGo   { do_add_exp(); }
 - (void)goldGo  { do_add_gold(); }
@@ -1614,13 +1880,18 @@ static void dk_build_ui(void) {
     mkToggleCard(CGRectMake(pad, y, cw, ch), @"⏱️", DK_GREEN, @"游戏加速", @"战斗整体变速", g_speedOn, g_helper, @selector(speedSw:), panel);
     mkToggleCard(CGRectMake(pad*2+cw, y, cw, ch), @"🚫", DK_GOLD, @"免广告", @"跳过视频直发奖", g_noAdOn, g_helper, @selector(noAdSw:), panel);
     y += ch + 7;
+    // ★ v3.8: 宝箱/掉落拉取 (解决"本体在宝箱上识别不到")
+    mkToggleCard(CGRectMake(pad, y, W - pad*2, ch), @"📦", DK_GREEN,
+                 @"宝箱/掉落拉取", @"自动把宝箱道具拉向英雄 (拾取不到就开这个)",
+                 g_pullOn, g_helper, @selector(pullSw:), panel);
+    y += ch + 7;
     mkGoCard(CGRectMake(pad, y, W - pad*2, 54), @"⚡", DK_GOLD, @"一键通关", g_helper, @selector(passTap), panel);
     y += 60;
     mkStepCard(CGRectMake(pad, y, W - pad*2, 54), @"🧭", DK_BLUE, @"加速倍率", @"点 ± 调整 (开加速后生效)",
                &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 60;
-    mkLabel(@"弹壳战机 1.1.7 · v3.7 · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.8 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithWhite:0.45 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -1747,7 +2018,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.7 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.8 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
@@ -1763,7 +2034,7 @@ static void dk_install_all(void) {
             static int k = 0;
             if (++k % 12 == 0) dk_ensure_overlay();
         }];
-        L("install done — 点球开面板 (7 功能)");
+        L("install done — 点球开面板 (8 功能)");
     });
 }
 
