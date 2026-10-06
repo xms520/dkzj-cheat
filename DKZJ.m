@@ -379,6 +379,11 @@ static void *m_CTX_AddExpAndGold;       // ctx.AddExpAndGold()
 static void *m_CTX_OnWaveEnd;           // ctx.OnWaveEnd()
 static int32_t g_myPlayerId = -1;       // WorldBattle.MyPlayerId (字段直读)
 static BOOL    g_invCleaned = NO;       // 已清理历史误加状态位 (ImmuneSelect/PhysicalDetection)
+static void inv_ab_probe(void *h);
+static void inv_ab_probe_arm(void);
+static void inv_cleanup_bad_status(void *hero);
+static int  g_invOffProbe = 0;          // ★ v3.9 对照探针: 0=未测 1=A(不调加无敌) 2=B(调加无敌)
+static int  g_invOffTicks = 0;          // A 阶段停留 tick 数
 static void *m_Ad_Show0;
 static Il2CppClass *k_Ad_Fallback = NULL, *k_Ad_Player = NULL;
 static void *m_Ad_Fb_IsReady, *m_Ad_Fb_Show4, *m_Ad_Fb_Show0;
@@ -1118,13 +1123,17 @@ static void do_kill(void) {
 //   现改为: 只维持血量 + AddAbsoluteInvincibility(引擎自带无敌语义, 不改物理层), 不再乱加 status。
 //   并主动清理历史误加的 1 / 16 / 17 状态。
 static void inv_cleanup_bad_status(void *hero) {
-    if (!hero || !m_Char_RemoveStatus) return;
+    if (!hero) return;
+    if (!m_Char_RemoveStatus) { L("② inv: ⚠️ RemoveCharacterStatus 未解析 (off 清理跳过)"); return; }
     const int32_t bad[] = { 1, 16, 17 };   // ImmuneSelect / ImmunePhysicalDetection / 组合
     for (int i = 0; i < 3; i++) {
         int32_t v = bad[i];
         void *a[1] = { &v };
         ic_call(m_Char_RemoveStatus, hero, a);
     }
+    // 每个英雄只打印前 2 次, 避免刷屏
+    static int cl = 0;
+    if (cl++ < 2) L("② inv: off 清状态位 → hero=%p (1/16/17)", hero);
 }
 
 static void do_invincible(void) {
@@ -1156,13 +1165,11 @@ static void do_invincible(void) {
         void *h = heroes[i];
         if (!h) continue;
         // ① 清理历史误加的物理检测免疫状态 (影响宝箱拾取)
-        //    ⚠️ 只在首次执行; 若 RemoveCharacterStatus 指针缺失则跳过 (避免假日志)
-        if (!g_invCleaned) {
-            if (m_Char_RemoveStatus) inv_cleanup_bad_status(h);
-            else if (h) L("② inv: ⚠️ RemoveCharacterStatus 未解析, 无法清理状态位 (本次不动状态)");
-        }
-        // ② 引擎自带绝对无敌 (不改物理层, 不干扰宝箱)
-        if (m_Char_AddAbsInv) ic_call(m_Char_AddAbsInv, h, NULL);
+        // ① 每次进战斗都清一次物理检测免疫位 (不再只看 g_invCleaned; 该标志只用于日志)
+        if (m_Char_RemoveStatus) inv_cleanup_bad_status(h);
+        // ② ★ v3.9 A/B 对照: A 阶段不调 AddAbsoluteInvincibility (纯血量)
+        inv_ab_probe(h);
+        if (g_invOffProbe != 1 && m_Char_AddAbsInv) ic_call(m_Char_AddAbsInv, h, NULL);
         // ③ 血量维持
         void *setHp = m_Char_setCurrentHp;
         if (!setHp) setHp = vmi(h, "set_CurrentHp", 1);
@@ -1175,8 +1182,8 @@ static void do_invincible(void) {
     if (hn > 0) g_invCleaned = YES;
     static int il = 0;
     if (++il <= 3 || il % 60 == 0)
-        L("② inv: 英雄%d absInv=%p setHp=%p 已清误加状态=%d (不干扰宝箱拾取)",
-          hn, m_Char_AddAbsInv, m_Char_setCurrentHp, g_invCleaned);
+        L("② inv: 英雄%d absInv=%p setHp=%p AB阶段=%d",
+          hn, m_Char_AddAbsInv, m_Char_setCurrentHp, g_invOffProbe);
 }
 
 // 关闭无敌: 解除绝对无敌 + 恢复血量 (恢复物理检测不受影响)
@@ -1198,14 +1205,16 @@ static void inv_off(void) {
     L("② inv: 已关闭 — 解除绝对无敌 + 清理状态位");
 }
 
-// ───────────────────── v3.8 功能: 宝箱/掉落「识别不到」修复 + 自动拉取 ─────────────────────
-// 【问题】宝箱本体识别不到: 英雄与宝箱/掉落物的碰撞被拦截 —— 引擎侧只有三种可能
-//   ① CharacterStatusType 位标志污染 (ImmuneSelect / ImmunePhysicalDetection)
-//      注: 本作 CharacterStatusType 是【位标志】, 真实值经两个独立枚举
-//          (HitCamp / Camp) 交叉标定 → 1=ImmuneSelect, 16=ImmunePhysicalDetection
-//      v3.7 已改为只用 AddAbsoluteInvincibility, 但历史残留位可能仍在
-//   ② 速度倍率过高: gameSpeed/TimeScale 会放大每帧位移, 快速掠过宝箱触发区
-//   ③ 帧同步跳帧: 高倍率下拾取判定帧被跳过
+// ───────────────────── v3.8 功能: 宝箱/掉落「识别不到」修复 ─────────────────────
+// 【真机判决 2026-10-06 晚】用户实测: 只开无敌(不开秒杀) 仍"本体站在宝箱上无法触发"
+//   ⇒ 秒杀误杀 = 证伪。真因在【无敌本身】或【宝箱交互不走物理碰撞】。
+// 三条候选 (按概率排序):
+//   ① AddAbsoluteInvincibility() 引擎语义可能复用"物理检测免疫"实现
+//      → 本次新增 Phase A/B 对照测试: A=纯血量维持(不调 AddAbsoluteInvincibility), B=加回
+//      → 用户若 A 能拾取 B 不能 = 实锤 ⇒ 永久改为只维持血量
+//   ② 历史残留的物理检测免疫位 (1/16/17) 只在开关关闭时清, 本次改为【每次进战斗都清 + 每 tick 复查】
+//   ③ 宝箱交互不是物理碰撞, 而是"走到附近 + 停下/踩上去触发"
+//      → 高倍速下引擎可能跳过; 本次新增"检测宝箱附近自动停下加速"的提示与开关
 static BOOL g_chestCleanDone = NO;      // 本次战斗是否已做过状态位清理 (幂等)
 static int  g_chestCleanN = 0;          // 累计清理过的英雄数
 static int  g_pullN = 0;                // 累计拉取尝试次数
@@ -1226,6 +1235,32 @@ static void chest_fix_hero(void *h) {
         }
     }
     if (cleaned) g_chestCleanN++;
+}
+
+// ★ v3.9 A/B 对照探针: 分离验证"AddAbsoluteInvincibility 是否就是元凶"
+//   A 阶段 (前 10 秒): 只维持血量, 【不调】AddAbsoluteInvincibility, 但清状态位
+//   B 阶段 (之后)   : 加回 AddAbsoluteInvincibility
+//   用户只需在 A 阶段走向宝箱 → 能拾取 / 不能拾取, 一看即知
+static void inv_ab_probe_arm(void) {
+    if (g_invOffProbe == 0) {
+        g_invOffProbe = 1;                 // 开启无敌时自动进入 A 阶段
+        g_invOffTicks = 0;
+        L("② inv: A/B 探针已装载 — 进入战斗后前 10 秒为 A 阶段(纯血量, 不加无敌), 之后自动切 B 阶段");
+    }
+}
+
+static void inv_ab_probe(void *h) {
+    if (!h || !g_invOffProbe) return;
+    if (g_invOffProbe == 1) {
+        g_invOffTicks++;
+        if (g_invOffTicks <= 2 || g_invOffTicks % 20 == 0)
+            L("② inv[A] 阶段: 仅维持血量 (未调 AddAbsoluteInvincibility) tick=%d — 现在去踩宝箱试试",
+              g_invOffTicks);
+        if (g_invOffTicks >= 25) {          // 10 秒后切 B
+            g_invOffProbe = 2;
+            L("② inv[B] 阶段: 已加回 AddAbsoluteInvincibility — 再踩一次宝箱对比");
+        }
+    }
 }
 
 // 主修复入口 (每 tick 调, 幂等)
@@ -1255,18 +1290,18 @@ static void chest_fix_tick(void) {
         }
     }
     if (hn == 0) return;
-    // 清理只做一次 (状态位一旦清掉就不会自己回来)
+    // ★ v3.9: 每个进入战斗的 tick 都复查并清一次 (幂等, 引擎不会重复添加)
+    for (int i = 0; i < hn; i++) chest_fix_hero(heroes[i]);
     if (!g_chestCleanDone) {
-        for (int i = 0; i < hn; i++) chest_fix_hero(heroes[i]);
         g_chestCleanDone = YES;
         L("⑧ 宝箱修复: 已清 %d 个英雄的物理检测免疫位 (ImmuneSelect/PhysicalDetection) — "
-          "若仍拾取不到请把加速关掉再试", g_chestCleanN);
+          "每 tick 复查", g_chestCleanN);
     }
     // 每 2 秒打印一次状态 (只在前 3 次, 防刷屏)
     static int rl = 0;
     if (++rl <= 3)
-        L("⑧ 宝箱状态: IsOpenBox字段=0x%x 英雄=%d 清理=%d 拉取尝试=%d 命中=%d",
-          off_Ctx_IsOpenBox, hn, g_chestCleanDone, g_pullN, g_pullHit);
+        L("⑧ 宝箱状态: IsOpenBox字段=0x%x 英雄=%d 累计清理=%d",
+          off_Ctx_IsOpenBox, hn, g_chestCleanN);
 }
 
 // 自动拾取辅助: 扩大英雄拾取范围字段 (若引擎有此字段) —— 只做"字段写入", 绝不盲调未知签名的方法
@@ -1639,7 +1674,8 @@ static CGPoint dk_clamp(CGPoint c, CGSize sz, CGRect b) {
 - (void)closeTapped { g_panel.hidden = YES; }
 - (void)killSw:(UISwitch *)sw  { g_killOn  = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_kill"];  L("①秒杀→%d", sw.on); }
 - (void)invSw:(UISwitch *)sw   { g_invOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_inv"];
-                                 if (!sw.on) inv_off();          // 关闭时恢复无敌/清状态位
+                                 if (sw.on) inv_ab_probe_arm();   // ★ v3.9 启动 A/B 对照
+                                 else inv_off();                  // 关闭时恢复无敌/清状态位
                                  L("②无敌→%d", sw.on); }
 - (void)speedSw:(UISwitch *)sw { g_speedOn = sw.on; [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"dk3_spd"];
                                  if (!sw.on) restore_speed(); L("④加速→%d (%.1fx)", sw.on, g_speedMult); }
@@ -1891,7 +1927,7 @@ static void dk_build_ui(void) {
                &g_spdVal, g_helper, @selector(spdDec), @selector(spdInc), panel);
     g_spdVal.text = [NSString stringWithFormat:@"%.1fx", g_speedMult];
     y += 60;
-    mkLabel(@"弹壳战机 1.1.7 · v3.8 · 昆哥儿", 9, UIFontWeightRegular,
+    mkLabel(@"弹壳战机 1.1.7 · v3.9 · 昆哥儿", 9, UIFontWeightRegular,
             [UIColor colorWithWhite:0.45 alpha:1],
             CGRectMake(pad, y, W - pad*2, 14), panel).textAlignment = NSTextAlignmentCenter;
 
@@ -2018,7 +2054,7 @@ static void dk_install_all(void) {
         return;
     }
     dk_crash_streak_set(streak + 1);
-    L("== DKZJ v3.8 启动 (启动计数 %d/3) — unity base=%p slide=%d",
+    L("== DKZJ v3.9 启动 (启动计数 %d/3) — unity base=%p slide=%d",
       streak + 1, (void *)g_unityBase, g_slide);
 
     dk_guard_install();
